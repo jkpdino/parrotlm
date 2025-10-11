@@ -61,6 +61,13 @@ class ConfigReviewScreen(Static):
 
         # Model info
         model_params = self._estimate_params()
+
+        # Build parameter info string
+        if self.config.model.use_moe:
+            params_str = f"~{model_params['total']:,} total, ~{model_params['active']:,} active"
+        else:
+            params_str = f"~{model_params['total']:,}"
+
         model_info = f"""
 [bold cyan]Model Configuration:[/bold cyan]
   Name: {self.config.name}
@@ -70,9 +77,28 @@ class ConfigReviewScreen(Static):
   Heads: {self.config.model.n_heads} query, {self.config.model.n_kv_heads} kv (GQA)
   Context: {self.config.model.context_length} tokens
   Vocab: {self.config.model.vocab_size:,}
-  Parameters: ~{model_params:,}
+  Parameters: {params_str}
   Device: {device_info}
+"""
 
+        # Add MoE section if enabled
+        if self.config.model.use_moe:
+            if self.config.model.moe_layers is None:
+                moe_layers_str = "all layers"
+            else:
+                moe_layers_str = f"layers {self.config.model.moe_layers}"
+
+            model_info += f"""
+[bold cyan]MoE Configuration:[/bold cyan]
+  Enabled: Yes
+  Total experts: {self.config.model.num_experts}
+  Active per token: {self.config.model.num_experts_active}
+  MoE layers: {moe_layers_str}
+  Load balance loss coef: {self.config.model.router_aux_loss_coef}
+  Router z-loss coef: {self.config.model.router_z_loss_coef}
+"""
+
+        model_info += f"""
 [bold cyan]Data Configuration:[/bold cyan]
   Dataset: {self.config.data.dataset_path}
   Tokenizer: {self.config.data.tokenizer_path}
@@ -115,25 +141,93 @@ class ConfigReviewScreen(Static):
 
         yield Label(model_info)
 
-    def _estimate_params(self) -> int:
-        """Estimate parameter count."""
+    def _estimate_params(self) -> dict:
+        """
+        Estimate parameter count.
+
+        Returns:
+            Dictionary with 'total', 'active', 'transformer', 'embeddings' keys
+            For non-MoE models, 'total' and 'active' are the same
+        """
         cfg = self.config.model
         # Token embeddings
         emb = cfg.vocab_size * cfg.dim
 
-        # Transformer blocks
-        per_block = (
-            # Attention
+        # Calculate attention parameters (same for all blocks)
+        attn_params = (
             cfg.dim * cfg.n_heads * (cfg.dim // cfg.n_heads) * 3 +  # QKV projections
-            cfg.dim * cfg.dim +  # Output projection
-            # FFN
-            cfg.dim * (int(2 * 4 * cfg.dim / 3)) * 3 +  # SwiGLU has 3 projections
-            # Norms
-            cfg.dim * 2
+            cfg.dim * cfg.dim  # Output projection
         )
-        transformer = per_block * cfg.depth
 
-        return emb + transformer
+        # Calculate FFN or MoE parameters
+        if cfg.use_moe:
+            # MoE: Calculate per-expert parameters
+            hidden_dim = int(2 * cfg.ffn_hidden_mult * cfg.dim / 3)
+            params_per_expert = (
+                cfg.dim * hidden_dim +  # gate_proj
+                cfg.dim * hidden_dim +  # up_proj
+                hidden_dim * cfg.dim    # down_proj
+            )
+            router_params = cfg.dim * cfg.num_experts
+
+            # Determine which layers use MoE
+            if cfg.moe_layers is None:
+                num_moe_layers = cfg.depth
+                num_dense_layers = 0
+            else:
+                num_moe_layers = len(cfg.moe_layers)
+                num_dense_layers = cfg.depth - num_moe_layers
+
+            # Dense FFN parameters (for non-MoE layers if any)
+            dense_ffn_params = cfg.dim * (int(2 * cfg.ffn_hidden_mult * cfg.dim / 3)) * 3
+
+            # Total MoE parameters
+            moe_ffn_params = num_moe_layers * (cfg.num_experts * params_per_expert + router_params)
+            dense_total_ffn = num_dense_layers * dense_ffn_params
+
+            # Active MoE parameters (only k experts active per token)
+            active_moe_ffn_params = num_moe_layers * (cfg.num_experts_active * params_per_expert + router_params)
+
+            # Norms (2 per block: pre-attn and pre-ffn)
+            norm_params = cfg.dim * 2 * cfg.depth
+
+            # Total transformer params
+            transformer_total = (
+                attn_params * cfg.depth +
+                moe_ffn_params + dense_total_ffn +
+                norm_params
+            )
+
+            # Active transformer params (for MoE, only count active experts)
+            transformer_active = (
+                attn_params * cfg.depth +
+                active_moe_ffn_params + dense_total_ffn +
+                norm_params
+            )
+
+            return {
+                'embeddings': emb,
+                'transformer': transformer_total,
+                'transformer_active': transformer_active,
+                'total': emb + transformer_total,
+                'active': emb + transformer_active
+            }
+        else:
+            # Dense FFN
+            ffn_params = cfg.dim * (int(2 * cfg.ffn_hidden_mult * cfg.dim / 3)) * 3
+            norm_params = cfg.dim * 2
+
+            per_block = attn_params + ffn_params + norm_params
+            transformer = per_block * cfg.depth
+            total = emb + transformer
+
+            return {
+                'embeddings': emb,
+                'transformer': transformer,
+                'transformer_active': transformer,
+                'total': total,
+                'active': total
+            }
 
 
 class TrainingApp(App):
@@ -250,7 +344,14 @@ class TrainingApp(App):
             ffn_hidden_mult=self.config.model.ffn_hidden_mult,
             pad_token_id=self.config.model.pad_token_id,
             rope_scaling_factor=self.config.model.rope_scaling_factor,
-            use_gradient_checkpointing=self.config.model.use_gradient_checkpointing
+            use_gradient_checkpointing=self.config.model.use_gradient_checkpointing,
+            # MoE parameters
+            use_moe=self.config.model.use_moe,
+            num_experts=self.config.model.num_experts,
+            num_experts_active=self.config.model.num_experts_active,
+            moe_layers=self.config.model.moe_layers,
+            router_aux_loss_coef=self.config.model.router_aux_loss_coef,
+            router_z_loss_coef=self.config.model.router_z_loss_coef
         ).to(self.device)
 
         # Create optimizer
@@ -375,14 +476,26 @@ class TrainingApp(App):
 
         # Forward pass
         self.model.train()
-        logits = self.model(tokens, masks)
+        result = self.model(tokens, masks)
 
-        # Compute loss
+        # Handle MoE models (return tuple) vs standard models (return tensor)
+        if isinstance(result, tuple):
+            logits, aux_losses = result
+        else:
+            logits = result
+            aux_losses = None
+
+        # Compute main loss
         loss = F.cross_entropy(
             logits.view(-1, self.config.model.vocab_size),
             labels.view(-1),
             ignore_index=0
         )
+
+        # Add auxiliary losses if using MoE
+        if aux_losses is not None:
+            for aux_loss_name, aux_loss_value in aux_losses.items():
+                loss = loss + aux_loss_value
 
         # Check for NaN/Inf
         if not torch.isfinite(loss):
@@ -475,12 +588,25 @@ class TrainingApp(App):
                     if num_batches >= self.config.monitoring.validation_samples // self.config.data.batch_size:
                         break
 
-                    logits = self.model(tokens, masks)
+                    result = self.model(tokens, masks)
+
+                    # Handle MoE models (return tuple) vs standard models (return tensor)
+                    if isinstance(result, tuple):
+                        logits, aux_losses = result
+                    else:
+                        logits = result
+                        aux_losses = None
+
                     loss = F.cross_entropy(
                         logits.view(-1, self.config.model.vocab_size),
                         labels.view(-1),
                         ignore_index=0
                     )
+
+                    # Add auxiliary losses if using MoE
+                    if aux_losses is not None:
+                        for aux_loss_name, aux_loss_value in aux_losses.items():
+                            loss = loss + aux_loss_value
 
                     # Only accumulate if loss is finite
                     if torch.isfinite(loss):

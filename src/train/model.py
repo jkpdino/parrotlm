@@ -277,6 +277,150 @@ class FeedForward(nn.Module):
         return x
 
 
+class MixtureOfExperts(nn.Module):
+    """
+    Mixture of Experts (MoE) layer with top-k routing.
+
+    Replaces standard FFN with multiple expert networks and a learned router.
+    Each token is routed to top-k experts, dramatically increasing model capacity
+    while maintaining constant computational cost per token.
+
+    Features:
+    - Top-k expert selection per token (typically k=2)
+    - Load balancing loss to encourage equal expert usage
+    - Router z-loss to prevent extreme logits
+    - Efficient expert parallelization
+
+    Used in: Switch Transformer, GLaM, GShard, GPT-4 (rumored)
+
+    Args:
+        dim: Model dimension
+        num_experts: Total number of expert networks
+        num_experts_active: Number of experts to activate per token (top-k)
+        hidden_mult: FFN hidden dimension multiplier (default: 4x)
+        dropout: Dropout probability
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_experts: int = 8,
+        num_experts_active: int = 2,
+        hidden_mult: int = 4,
+        dropout: float = 0.0
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_experts = num_experts
+        self.num_experts_active = num_experts_active
+
+        # Router: learns to assign tokens to experts
+        self.router = nn.Linear(dim, num_experts, bias=False)
+
+        # Expert networks: each is a standard FeedForward layer
+        self.experts = nn.ModuleList([
+            FeedForward(dim, hidden_mult, dropout)
+            for _ in range(num_experts)
+        ])
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Forward pass with expert routing.
+
+        Args:
+            x: (batch, seq_len, dim) input tensor
+
+        Returns:
+            Tuple of (output, aux_losses):
+            - output: (batch, seq_len, dim) processed tensor
+            - aux_losses: dict with 'load_balance_loss' and 'router_z_loss'
+        """
+        batch_size, seq_len, dim = x.shape
+
+        # Flatten to (batch * seq_len, dim) for routing
+        x_flat = x.view(-1, dim)  # (batch * seq_len, dim)
+
+        # Compute router logits for each token
+        router_logits = self.router(x_flat)  # (batch * seq_len, num_experts)
+
+        # Select top-k experts per token
+        topk_logits, topk_indices = torch.topk(
+            router_logits, self.num_experts_active, dim=-1
+        )  # Both: (batch * seq_len, num_experts_active)
+
+        # Compute routing weights with softmax over top-k experts
+        routing_weights = F.softmax(topk_logits, dim=-1)  # (batch * seq_len, num_experts_active)
+
+        # Initialize output
+        output = torch.zeros_like(x_flat)  # (batch * seq_len, dim)
+
+        # Route tokens to experts
+        # For efficiency, we process each expert separately
+        for expert_idx in range(self.num_experts):
+            # Find tokens routed to this expert
+            expert_mask = (topk_indices == expert_idx).any(dim=-1)  # (batch * seq_len,)
+            token_indices = expert_mask.nonzero(as_tuple=True)[0]  # Indices of tokens for this expert
+
+            if len(token_indices) == 0:
+                continue  # No tokens routed to this expert
+
+            # Get tokens for this expert
+            expert_input = x_flat[token_indices]  # (num_tokens, dim)
+
+            # Process through expert
+            expert_output = self.experts[expert_idx](expert_input)  # (num_tokens, dim)
+
+            # Get routing weights for these tokens to this expert
+            # Find which position in top-k this expert is for each token
+            for k_idx in range(self.num_experts_active):
+                k_mask = topk_indices[token_indices, k_idx] == expert_idx
+                if k_mask.any():
+                    weights = routing_weights[token_indices[k_mask], k_idx].unsqueeze(-1)  # (num_matched, 1)
+                    output[token_indices[k_mask]] += weights * expert_output[k_mask]
+
+        # Reshape back to (batch, seq_len, dim)
+        output = output.view(batch_size, seq_len, dim)
+
+        # Compute auxiliary losses
+        aux_losses = self._compute_aux_losses(router_logits)
+
+        return output, aux_losses
+
+    def _compute_aux_losses(self, router_logits: torch.Tensor) -> dict[str, torch.Tensor]:
+        """
+        Compute auxiliary losses for training.
+
+        Args:
+            router_logits: (batch * seq_len, num_experts) router output
+
+        Returns:
+            Dictionary with auxiliary losses:
+            - load_balance_loss: Encourages equal expert usage
+            - router_z_loss: Prevents extreme router logits
+        """
+        # 1. Load balancing loss
+        # Encourages equal token distribution across experts
+        # Based on: "Outrageously Large Neural Networks" (Shazeer et al., 2017)
+
+        # Compute fraction of tokens routed to each expert (via softmax)
+        router_probs = F.softmax(router_logits, dim=-1)  # (batch * seq_len, num_experts)
+        expert_usage = router_probs.mean(dim=0)  # (num_experts,)
+
+        # Load balancing loss: variance of expert usage
+        # Minimizing this encourages uniform distribution
+        load_balance_loss = self.num_experts * (expert_usage ** 2).sum()
+
+        # 2. Router z-loss
+        # Penalizes large router logits to improve training stability
+        # Based on: "ST-MoE: Designing Stable and Transferable Sparse Expert Models" (Zoph et al., 2022)
+        router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
+
+        return {
+            'load_balance_loss': load_balance_loss,
+            'router_z_loss': router_z_loss
+        }
+
+
 class TransformerBlock(nn.Module):
     """Transformer block with pre-norm architecture using RMSNorm."""
 
@@ -287,32 +431,50 @@ class TransformerBlock(nn.Module):
         n_kv_heads: int = None,
         ffn_hidden_mult: int = 4,
         dropout: float = 0.0,
-        max_seq_len: int = 2048
+        max_seq_len: int = 2048,
+        # MoE parameters
+        use_moe: bool = False,
+        num_experts: int = 8,
+        num_experts_active: int = 2
     ):
         super().__init__()
+
+        self.use_moe = use_moe
 
         self.norm1 = RMSNorm(dim)
         self.attn = MultiHeadSelfAttention(dim, n_heads, n_kv_heads, dropout, max_seq_len)
 
         self.norm2 = RMSNorm(dim)
-        self.ffn = FeedForward(dim, ffn_hidden_mult, dropout)
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        # Conditionally create FFN or MoE
+        if use_moe:
+            self.ffn = MixtureOfExperts(dim, num_experts, num_experts_active, ffn_hidden_mult, dropout)
+        else:
+            self.ffn = FeedForward(dim, ffn_hidden_mult, dropout)
+
+    def forward(
+        self, x: torch.Tensor, attention_mask: torch.Tensor = None
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | torch.Tensor:
         """
         Args:
             x: (batch, seq_len, dim)
             attention_mask: (batch, seq_len, seq_len) additive mask
 
         Returns:
-            (batch, seq_len, dim)
+            If MoE: (output, aux_losses) where aux_losses is dict
+            Otherwise: output tensor
         """
         # Pre-norm attention with residual
         x = x + self.attn(self.norm1(x), attention_mask)
 
         # Pre-norm FFN with residual
-        x = x + self.ffn(self.norm2(x))
-
-        return x
+        if self.use_moe:
+            ffn_output, aux_losses = self.ffn(self.norm2(x))
+            x = x + ffn_output
+            return x, aux_losses
+        else:
+            x = x + self.ffn(self.norm2(x))
+            return x
 
 
 class GPT(nn.Module):
@@ -330,7 +492,7 @@ class GPT(nn.Module):
     - Pre-norm architecture
 
     Configuration for ~1.8M parameters (excluding embeddings):
-        GPT(vocab_size=8000, dim=96, depth=16, n_heads=6, n_kv_heads=2)
+        GPT(vocab_size=8192, dim=96, depth=16, n_heads=6, n_kv_heads=2)
 
     Args:
         vocab_size: Size of the vocabulary
@@ -346,19 +508,19 @@ class GPT(nn.Module):
         use_gradient_checkpointing: If True, use gradient checkpointing to reduce memory usage during training
 
     Example:
-        >>> model = GPT(vocab_size=8000, dim=96, depth=16, n_heads=6)
+        >>> model = GPT(vocab_size=8192, dim=96, depth=16, n_heads=6)
         >>> print(f"Transformer params: {model.count_parameters()['transformer']:,}")
         >>> print(f"Total params: {model.count_parameters()['total']:,}")
         >>>
         >>> # Forward pass
-        >>> tokens = torch.randint(0, 8000, (4, 512))  # (batch, seq_len)
+        >>> tokens = torch.randint(0, 8192, (4, 512))  # (batch, seq_len)
         >>> masks = torch.zeros(4, 512, 512)  # (batch, seq_len, seq_len)
-        >>> logits = model(tokens, masks)  # (4, 512, 8000)
+        >>> logits = model(tokens, masks)  # (4, 512, 8192)
     """
 
     def __init__(
         self,
-        vocab_size: int = 8000,
+        vocab_size: int = 8192  ,
         dim: int = 96,
         depth: int = 16,
         n_heads: int = 6,
@@ -368,7 +530,14 @@ class GPT(nn.Module):
         ffn_hidden_mult: int = 4,
         pad_token_id: int = 0,
         rope_scaling_factor: float = 4.0,
-        use_gradient_checkpointing: bool = False
+        use_gradient_checkpointing: bool = False,
+        # MoE parameters
+        use_moe: bool = False,
+        num_experts: int = 8,
+        num_experts_active: int = 2,
+        moe_layers: list[int] = None,
+        router_aux_loss_coef: float = 0.01,
+        router_z_loss_coef: float = 0.001
     ):
         super().__init__()
 
@@ -381,6 +550,14 @@ class GPT(nn.Module):
         self.pad_token_id = pad_token_id
         self.rope_scaling_factor = rope_scaling_factor
         self.use_gradient_checkpointing = use_gradient_checkpointing
+
+        # MoE configuration
+        self.use_moe = use_moe
+        self.num_experts = num_experts
+        self.num_experts_active = num_experts_active
+        self.moe_layers = moe_layers  # None means all layers use MoE
+        self.router_aux_loss_coef = router_aux_loss_coef
+        self.router_z_loss_coef = router_z_loss_coef
 
         # Token embeddings (position info comes from RoPE instead)
         self.token_embedding = nn.Embedding(vocab_size, dim)
@@ -395,9 +572,13 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([
             TransformerBlock(
                 dim, n_heads, self.n_kv_heads, ffn_hidden_mult, dropout,
-                max_seq_len=int(context_length * rope_scaling_factor)
+                max_seq_len=int(context_length * rope_scaling_factor),
+                # MoE: enable for this layer if use_moe and (all layers OR this layer in moe_layers)
+                use_moe=use_moe and (moe_layers is None or i in moe_layers),
+                num_experts=num_experts,
+                num_experts_active=num_experts_active
             )
-            for _ in range(depth)
+            for i in range(depth)
         ])
 
         # Final RMS norm
@@ -467,7 +648,9 @@ class GPT(nn.Module):
                 # RMSNorm only has weight (scale), no bias
                 nn.init.ones_(module.weight)
 
-    def forward(self, tokens: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self, tokens: torch.Tensor, attention_mask: torch.Tensor = None
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Forward pass through the model.
 
@@ -478,7 +661,8 @@ class GPT(nn.Module):
                            If None, only causal masking is applied
 
         Returns:
-            logits: (batch, seq_len, vocab_size) unnormalized predictions
+            If MoE: (logits, aux_losses) where aux_losses contains weighted MoE losses
+            Otherwise: logits (batch, seq_len, vocab_size) unnormalized predictions
         """
         batch_size, seq_len = tokens.shape
 
@@ -516,14 +700,37 @@ class GPT(nn.Module):
         x = self.token_embedding(tokens)  # (batch, seq_len, dim)
         x = self.emb_dropout(x)
 
+        # Initialize auxiliary loss accumulator for MoE
+        total_aux_loss = None
+        if self.use_moe:
+            total_aux_loss = {
+                'load_balance_loss': 0.0,
+                'router_z_loss': 0.0
+            }
+
         # Apply transformer blocks with optional gradient checkpointing
         # Pass the SAME combined mask to all blocks (no recreating masks per layer)
         for block in self.blocks:
             if self.use_gradient_checkpointing and self.training:
                 # Use gradient checkpointing to save memory during training
-                x = torch.utils.checkpoint.checkpoint(block, x, combined_mask, use_reentrant=False)
+                # Note: Gradient checkpointing with MoE is complex, using without for now
+                if block.use_moe:
+                    x, aux_losses = block(x, combined_mask)
+                    if total_aux_loss is not None:
+                        total_aux_loss['load_balance_loss'] += aux_losses['load_balance_loss']
+                        total_aux_loss['router_z_loss'] += aux_losses['router_z_loss']
+                else:
+                    x = torch.utils.checkpoint.checkpoint(block, x, combined_mask, use_reentrant=False)
             else:
-                x = block(x, combined_mask)
+                result = block(x, combined_mask)
+                # Handle both MoE blocks (returns tuple) and standard blocks (returns tensor)
+                if isinstance(result, tuple):
+                    x, aux_losses = result
+                    if total_aux_loss is not None:
+                        total_aux_loss['load_balance_loss'] += aux_losses['load_balance_loss']
+                        total_aux_loss['router_z_loss'] += aux_losses['router_z_loss']
+                else:
+                    x = result
 
         # Final RMS norm
         x = self.norm_f(x)
@@ -531,7 +738,16 @@ class GPT(nn.Module):
         # Project to vocabulary (using tied embeddings)
         logits = F.linear(x, self.token_embedding.weight)  # (batch, seq_len, vocab_size)
 
-        return logits
+        # Return logits with aux losses if using MoE
+        if self.use_moe and total_aux_loss is not None:
+            # Apply loss coefficients
+            weighted_aux_loss = {
+                'load_balance_loss': self.router_aux_loss_coef * total_aux_loss['load_balance_loss'],
+                'router_z_loss': self.router_z_loss_coef * total_aux_loss['router_z_loss']
+            }
+            return logits, weighted_aux_loss
+        else:
+            return logits
 
     def count_parameters(self, exclude_embeddings: bool = False) -> dict[str, int]:
         """
@@ -604,7 +820,13 @@ class GPT(nn.Module):
 
             # Forward pass
             with torch.no_grad():
-                logits = self(tokens_crop)  # (batch, seq_len, vocab_size)
+                result = self(tokens_crop)  # (batch, seq_len, vocab_size) or tuple with aux_losses
+
+                # Handle MoE models (return tuple) vs standard models (return tensor)
+                if isinstance(result, tuple):
+                    logits, _ = result  # Ignore aux losses during generation
+                else:
+                    logits = result
 
             # Get logits for last position
             logits = logits[:, -1, :].clone()  # (batch, vocab_size)
@@ -658,7 +880,7 @@ class GPT(nn.Module):
 
     def __repr__(self) -> str:
         """Return a detailed string representation of the model."""
-        return (
+        base_info = (
             f"GPT(\n"
             f"  vocab_size={self.vocab_size},\n"
             f"  dim={self.dim},\n"
@@ -667,9 +889,22 @@ class GPT(nn.Module):
             f"  n_kv_heads={self.n_kv_heads},\n"
             f"  context_length={self.context_length},\n"
             f"  use_gradient_checkpointing={self.use_gradient_checkpointing},\n"
-            f"  total_params={self.count_parameters()['total']:,}\n"
-            f")"
         )
+
+        if self.use_moe:
+            moe_info = (
+                f"  use_moe=True,\n"
+                f"  num_experts={self.num_experts},\n"
+                f"  num_experts_active={self.num_experts_active},\n"
+                f"  moe_layers={'all' if self.moe_layers is None else self.moe_layers},\n"
+            )
+            base_info += moe_info
+
+        params = self.count_parameters()
+        base_info += f"  total_params={params['total']:,}\n"
+        base_info += ")"
+
+        return base_info
 
 
 def create_default_gpt(use_mqa=False):
@@ -685,7 +920,7 @@ def create_default_gpt(use_mqa=False):
     n_kv_heads = 1 if use_mqa else 2
 
     return GPT(
-        vocab_size=8000,
+        vocab_size=8192,
         dim=96,
         depth=16,
         n_heads=6,

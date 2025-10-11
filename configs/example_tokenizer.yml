@@ -8,7 +8,7 @@ name: example_bpe_tokenizer
 type: bpe
 
 # Target vocabulary size
-vocab_size: 8000
+vocab_size: 8192
 
 # Minimum frequency for tokens (tokens appearing less than this will be ignored)
 min_frequency: 2

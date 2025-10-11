@@ -327,7 +327,7 @@ You can train custom tokenizers on your datasets using BPE (Byte-Pair Encoding),
 
 ```bash
 # Train from an existing dataset
-uv run train_tokenizer.py --dataset tinystories_100k --name tinystories_bpe --vocab-size 8000
+uv run train_tokenizer.py --dataset tinystories_100k --name tinystories_bpe --vocab-size 8192
 
 # Train from text files
 uv run train_tokenizer.py --files data/*.txt --name custom_tokenizer --vocab-size 30000
@@ -374,7 +374,7 @@ Create a YAML configuration file for reproducible tokenizer training:
 # configs/my_tokenizer.yml
 name: my_custom_tokenizer
 type: bpe
-vocab_size: 8000
+vocab_size: 8192
 min_frequency: 2
 
 # Special tokens
@@ -445,7 +445,7 @@ print(encoding.ids)     # [245, 11, 234, 8]
 uv run download.py configs/tinystories_100k.yml
 
 # 2. Train custom tokenizer
-uv run train_tokenizer.py --dataset tinystories_100k --name tinystories_bpe_8k --vocab-size 8000
+uv run train_tokenizer.py --dataset tinystories_100k --name tinystories_bpe_8k --vocab-size 8192
 
 # 3. Pretokenize dataset with custom tokenizer
 uv run pretokenize.py configs/tinystories_100k.yml --tokenizer tokenizers/tinystories_bpe_8k/tokenizer.json

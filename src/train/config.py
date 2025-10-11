@@ -13,7 +13,7 @@ from ..exceptions import ConfigError, ValidationError
 class ModelConfig:
     """Configuration for model architecture."""
 
-    vocab_size: int = 8000
+    vocab_size: int = 8192
     dim: int = 96
     depth: int = 16
     n_heads: int = 6
@@ -24,6 +24,14 @@ class ModelConfig:
     pad_token_id: int = 0
     rope_scaling_factor: float = 4.0
     use_gradient_checkpointing: bool = False
+
+    # MoE (Mixture of Experts) configuration
+    use_moe: bool = False
+    num_experts: int = 8
+    num_experts_active: int = 2
+    moe_layers: Optional[list[int]] = None  # Which layers use MoE (None = all layers)
+    router_aux_loss_coef: float = 0.01
+    router_z_loss_coef: float = 0.001
 
     def __post_init__(self):
         """Validate model configuration."""
@@ -48,6 +56,25 @@ class ModelConfig:
             raise ValidationError("context_length must be positive")
         if not 0.0 <= self.dropout < 1.0:
             raise ValidationError("dropout must be in range [0, 1)")
+        # MoE validation
+        if self.use_moe:
+            if self.num_experts <= 0:
+                raise ValidationError("num_experts must be positive")
+            if self.num_experts_active <= 0:
+                raise ValidationError("num_experts_active must be positive")
+            if self.num_experts_active > self.num_experts:
+                raise ValidationError(
+                    f"num_experts_active ({self.num_experts_active}) cannot exceed num_experts ({self.num_experts})"
+                )
+            if self.moe_layers is not None:
+                if not all(0 <= layer < self.depth for layer in self.moe_layers):
+                    raise ValidationError(
+                        f"moe_layers must contain valid layer indices in range [0, {self.depth})"
+                    )
+            if self.router_aux_loss_coef < 0:
+                raise ValidationError("router_aux_loss_coef must be non-negative")
+            if self.router_z_loss_coef < 0:
+                raise ValidationError("router_z_loss_coef must be non-negative")
 
 
 @dataclass
@@ -200,7 +227,7 @@ def load_training_config(config_path: str | Path) -> TrainingRunConfig:
     # Parse model config
     model_data = data.get('model', {})
     model_config = ModelConfig(
-        vocab_size=model_data.get('vocab_size', 8000),
+        vocab_size=model_data.get('vocab_size', 8192),
         dim=model_data.get('dim', 96),
         depth=model_data.get('depth', 16),
         n_heads=model_data.get('n_heads', 6),
@@ -210,7 +237,14 @@ def load_training_config(config_path: str | Path) -> TrainingRunConfig:
         ffn_hidden_mult=model_data.get('ffn_hidden_mult', 4),
         pad_token_id=model_data.get('pad_token_id', 0),
         rope_scaling_factor=model_data.get('rope_scaling_factor', 4.0),
-        use_gradient_checkpointing=model_data.get('use_gradient_checkpointing', False)
+        use_gradient_checkpointing=model_data.get('use_gradient_checkpointing', False),
+        # MoE parameters
+        use_moe=model_data.get('use_moe', False),
+        num_experts=model_data.get('num_experts', 8),
+        num_experts_active=model_data.get('num_experts_active', 2),
+        moe_layers=model_data.get('moe_layers', None),
+        router_aux_loss_coef=model_data.get('router_aux_loss_coef', 0.01),
+        router_z_loss_coef=model_data.get('router_z_loss_coef', 0.001)
     )
 
     # Parse data config
@@ -297,7 +331,14 @@ def save_training_config(config: TrainingRunConfig, output_path: str | Path) -> 
             'ffn_hidden_mult': config.model.ffn_hidden_mult,
             'pad_token_id': config.model.pad_token_id,
             'rope_scaling_factor': config.model.rope_scaling_factor,
-            'use_gradient_checkpointing': config.model.use_gradient_checkpointing
+            'use_gradient_checkpointing': config.model.use_gradient_checkpointing,
+            # MoE parameters
+            'use_moe': config.model.use_moe,
+            'num_experts': config.model.num_experts,
+            'num_experts_active': config.model.num_experts_active,
+            'moe_layers': config.model.moe_layers,
+            'router_aux_loss_coef': config.model.router_aux_loss_coef,
+            'router_z_loss_coef': config.model.router_z_loss_coef
         },
         'data': {
             'dataset_path': config.data.dataset_path,

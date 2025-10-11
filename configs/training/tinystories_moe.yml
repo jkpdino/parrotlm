@@ -1,10 +1,10 @@
-# TinyStories GPT Training Configuration
-# Small model (~1.8M parameters) for training on TinyStories dataset
+# TinyStories GPT Training Configuration with MoE
+# MoE model with 16 experts, 2 active (~1.8M active parameters, ~12M total)
 
-name: tinystories_gpt_tiny
+name: tinystories_gpt_moe
 random_seed: 42
 
-# Model architecture
+# Model architecture with MoE
 model:
   vocab_size: 8192 # Match your tokenizer vocab size
   dim: 96 # Model dimension
@@ -17,6 +17,14 @@ model:
   pad_token_id: 0 # Padding token ID
   rope_scaling_factor: 4.0 # RoPE cache scaling factor
   use_gradient_checkpointing: false # Enable for larger models to save memory
+
+  # MoE (Mixture of Experts) configuration
+  use_moe: true # Enable MoE
+  num_experts: 64 # Total number of expert networks
+  num_experts_active: 2 # Number of experts activated per token (top-k)
+  moe_layers: null # Which layers use MoE (null = all layers, or specify list like [8, 9, 10, 11, 12, 13, 14, 15])
+  router_aux_loss_coef: 0.01 # Load balancing loss weight
+  router_z_loss_coef: 0.001 # Router z-loss weight (prevents extreme logits)
 
 # Data configuration
 data:
