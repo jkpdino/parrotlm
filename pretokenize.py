@@ -40,8 +40,15 @@ def get_tokenizer_short_name(tokenizer_name: str) -> str:
     """
     # If it has a slash, take the part after it
     if '/' in tokenizer_name:
-        return tokenizer_name.split('/')[-1]
-    return tokenizer_name
+        short_name = tokenizer_name.split('/')[-1]
+    else:
+        short_name = tokenizer_name
+
+    # Strip .json extension if present
+    if short_name.endswith('.json'):
+        short_name = short_name[:-5]
+
+    return short_name
 
 
 def main():
