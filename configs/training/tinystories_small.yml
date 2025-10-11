@@ -1,0 +1,55 @@
+# TinyStories GPT Training Configuration
+# Small model (~1.8M parameters) for training on TinyStories dataset
+
+name: tinystories_gpt_small
+random_seed: 42
+
+# Model architecture
+model:
+  vocab_size: 8192 # Match your tokenizer vocab size
+  dim: 160 # Model dimension
+  depth: 32 # Number of transformer layers
+  n_heads: 10 # Number of query heads
+  n_kv_heads: 5 # Number of key/value heads (GQA: 3:1 ratio)
+  context_length: 1024 # Maximum sequence length
+  dropout: 0.0 # Dropout (modern LLMs use 0.0)
+  ffn_hidden_mult: 4 # FFN hidden dimension multiplier
+  pad_token_id: 0 # Padding token ID
+  rope_scaling_factor: 4.0 # RoPE cache scaling factor
+  use_gradient_checkpointing: false # Enable for larger models to save memory
+
+# Data configuration
+data:
+  dataset_path: "datasets/tinystories/pretokenized/tokenizer"
+  tokenizer_path: "tokenizers/tinystories_tokenizer/tokenizer.json"
+  batch_size: 32 # Batch size (adjust based on GPU memory)
+  shuffle: false # Shuffle training data
+  num_workers: 0 # DataLoader workers (0 for single-threaded)
+
+# Training hyperparameters
+training:
+  learning_rate: 0.003 # Learning rate (Muon works well with higher LR)
+  max_batches: 1000 # Maximum number of batches
+  max_tokens: null # Or specify max tokens instead
+  optimizer: "adamw" # "muon" or "adamw"
+  warmup_batches: 100 # Linear warmup batches
+  weight_decay: 0.1 # Weight decay
+  grad_clip: 1.0 # Gradient clipping (null to disable)
+  lr_schedule: "cosine" # "constant", "cosine", or "linear"
+  min_lr_ratio: 0.1 # Minimum LR as ratio of base LR
+
+# Checkpointing
+checkpointing:
+  save_every_n_batches: 100 # Save checkpoint every N batches
+  keep_last_n: 10 # Keep last N numbered checkpoints
+  output_dir: "training_runs" # Base directory for training runs
+
+# Monitoring and validation
+monitoring:
+  validate_every_n_batches: 100 # Run validation every N batches
+  validation_samples: 100 # Number of validation samples to evaluate
+  inference_every_n_batches: 1 # Generate sample every N batches
+  inference_prompt: "Once upon a time" # Prompt for sample generation
+  inference_max_tokens: 50 # Max tokens to generate
+  inference_temperature: 1.0 # Sampling temperature
+  graph_window_size: 1000 # Number of points to show in graphs
