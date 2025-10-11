@@ -38,7 +38,7 @@ data:
 training:
   learning_rate: 0.003 # Learning rate (Muon works well with higher LR)
   max_batches: null # Maximum number of batches
-  max_tokens: null # Or specify max tokens instead
+  max_tokens: 500000000 # Or specify max tokens instead
   optimizer: "adamw" # "muon" or "adamw"
   warmup_batches: 100 # Linear warmup batches
   weight_decay: 0.1 # Weight decay
