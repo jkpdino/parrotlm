@@ -5,8 +5,8 @@ key: tinystories
 name: tinystories
 
 # Train/validation split ratios
-train_split: 0.8 # 80k for training
-validation_split: 0.2 # 20k for validation
+train_split: 0.99 # 80k for training
+validation_split: 0.01 # 20k for validation
 
 # Random seed for reproducibility
 random_seed: 42
@@ -15,4 +15,7 @@ random_seed: 42
 slices:
   - key: tinystories_main
     huggingface: "roneneldan/TinyStories:train"
+    sampling: random # Randomly sample 100k stories
+  - key: tinystories_main
+    huggingface: "roneneldan/TinyStories:validation"
     sampling: random # Randomly sample 100k stories

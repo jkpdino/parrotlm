@@ -492,7 +492,7 @@ class GPT(nn.Module):
     - Pre-norm architecture
 
     Configuration for ~1.8M parameters (excluding embeddings):
-        GPT(vocab_size=8192, dim=96, depth=16, n_heads=6, n_kv_heads=2)
+        GPT(vocab_size=16384, dim=96, depth=16, n_heads=6, n_kv_heads=2)
 
     Args:
         vocab_size: Size of the vocabulary
@@ -508,19 +508,19 @@ class GPT(nn.Module):
         use_gradient_checkpointing: If True, use gradient checkpointing to reduce memory usage during training
 
     Example:
-        >>> model = GPT(vocab_size=8192, dim=96, depth=16, n_heads=6)
+        >>> model = GPT(vocab_size=16384, dim=96, depth=16, n_heads=6)
         >>> print(f"Transformer params: {model.count_parameters()['transformer']:,}")
         >>> print(f"Total params: {model.count_parameters()['total']:,}")
         >>>
         >>> # Forward pass
-        >>> tokens = torch.randint(0, 8192, (4, 512))  # (batch, seq_len)
+        >>> tokens = torch.randint(0, 16384, (4, 512))  # (batch, seq_len)
         >>> masks = torch.zeros(4, 512, 512)  # (batch, seq_len, seq_len)
-        >>> logits = model(tokens, masks)  # (4, 512, 8192)
+        >>> logits = model(tokens, masks)  # (4, 512, 16384)
     """
 
     def __init__(
         self,
-        vocab_size: int = 8192  ,
+        vocab_size: int = 16384  ,
         dim: int = 96,
         depth: int = 16,
         n_heads: int = 6,
@@ -920,7 +920,7 @@ def create_default_gpt(use_mqa=False):
     n_kv_heads = 1 if use_mqa else 2
 
     return GPT(
-        vocab_size=8192,
+        vocab_size=16384,
         dim=96,
         depth=16,
         n_heads=6,

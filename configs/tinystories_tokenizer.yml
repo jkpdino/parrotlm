@@ -8,11 +8,10 @@ name: tinystories_tokenizer
 type: bpe
 
 # Target vocabulary size
-vocab_size: 8192
+vocab_size: 16384
 
 # Minimum frequency for tokens (tokens appearing less than this will be ignored)
-min_frequency: 2
-
+min_frequency: 0
 # Special tokens to include in the vocabulary
 # These tokens will be assigned IDs in the order specified
 special_tokens:
@@ -38,11 +37,11 @@ text_field: text
 
 # Normalizer: How to normalize text before tokenization
 # Options: "nfc", "nfd", "nfkc", "nfkd", "lowercase", "nfc_lowercase", "none"
-normalizer: nfc_lowercase
+normalizer: nfc
 
 # Pre-tokenizer: How to split text before learning tokens
 # Options: "whitespace", "byte_level", "digits", "whitespace_digits"
-pre_tokenizer: whitespace
+pre_tokenizer: byte_level
 
 # Output directory (default: "tokenizers")
 output_dir: tokenizers
