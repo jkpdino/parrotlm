@@ -30,14 +30,14 @@ model:
 data:
   dataset_path: "datasets/tinystories/pretokenized/tokenizer"
   tokenizer_path: "tokenizers/tinystories_tokenizer/tokenizer.json"
-  batch_size: 32 # Batch size (adjust based on GPU memory)
+  batch_size: 128 # Batch size (adjust based on GPU memory)
   shuffle: true # Shuffle training data
   num_workers: 0 # DataLoader workers (0 for single-threaded)
 
 # Training hyperparameters
 training:
   learning_rate: 0.003 # Learning rate (Muon works well with higher LR)
-  max_batches: 1000 # Maximum number of batches
+  max_batches: null # Maximum number of batches
   max_tokens: null # Or specify max tokens instead
   optimizer: "adamw" # "muon" or "adamw"
   warmup_batches: 100 # Linear warmup batches
