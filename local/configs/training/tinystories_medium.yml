@@ -22,7 +22,7 @@ model:
 data:
   dataset_path: "datasets/tinystories/pretokenized/tokenizer"
   tokenizer_path: "tokenizers/tinystories_tokenizer/tokenizer.json"
-  batch_size: 64 # Batch size (adjust based on GPU memory)
+  batch_size: 32 # Batch size (adjust based on GPU memory)
   shuffle: false # Shuffle training data
   num_workers: 0 # DataLoader workers (0 for single-threaded)
 

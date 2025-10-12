@@ -1,0 +1,51 @@
+# Example Tokenizer Training Configuration
+# This file demonstrates how to train a custom tokenizer using YAML configuration
+
+# Tokenizer name (output directory will be tokenizers/<name>)
+name: example_bpe_tokenizer
+
+# Tokenizer type: "bpe", "wordpiece", or "unigram"
+type: bpe
+
+# Target vocabulary size
+vocab_size: 16384
+
+# Minimum frequency for tokens (tokens appearing less than this will be ignored)
+min_frequency: 2
+
+# Special tokens to include in the vocabulary
+# These tokens will be assigned IDs in the order specified
+special_tokens:
+  - "<|pad|>" # Padding token
+  - "<|unk|>" # Unknown token
+  - "<|bos|>" # Beginning of sequence
+  - "<|eos|>" # End of sequence
+
+# Input source (choose one):
+
+# Option 1: Train from an existing dataset
+dataset: tinystories_100k
+split: train
+text_field: text
+
+# Option 2: Train from files (comment out dataset above and uncomment below)
+# files:
+#   - data/corpus1.txt
+#   - data/corpus2.txt
+#   - data/dataset.jsonl
+
+# Text processing options
+
+# Normalizer: How to normalize text before tokenization
+# Options: "nfc", "nfd", "nfkc", "nfkd", "lowercase", "nfc_lowercase", "none"
+normalizer: nfc_lowercase
+
+# Pre-tokenizer: How to split text before learning tokens
+# Options: "whitespace", "byte_level", "digits", "whitespace_digits"
+pre_tokenizer: whitespace
+
+# Output directory (default: "tokenizers")
+output_dir: tokenizers
+
+# Dataset directory (default: "datasets")
+datasets_dir: datasets

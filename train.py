@@ -26,6 +26,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.profiler import profile, record_function, ProfilerActivity, schedule, tensorboard_trace_handler
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Button, Footer, Header, Label, Static
@@ -265,7 +266,10 @@ class TrainingApp(App):
     def __init__(
         self,
         config: TrainingRunConfig,
-        resume_checkpoint: Optional[Path] = None
+        resume_checkpoint: Optional[Path] = None,
+        enable_profiling: bool = False,
+        profile_dir: str = "./profiling_logs",
+        profile_schedule: Optional[dict] = None
     ):
         super().__init__()
         self.config = config
@@ -275,6 +279,17 @@ class TrainingApp(App):
         self.is_paused = False
         self.is_training = False
         self.should_quit = False
+
+        # Profiling configuration
+        self.enable_profiling = enable_profiling
+        self.profile_dir = Path(profile_dir)
+        self.profile_schedule = profile_schedule or {
+            'wait': 5,
+            'warmup': 2,
+            'active': 3,
+            'repeat': 1
+        }
+        self.profiler = None
 
         # Components (will be initialized in on_mount)
         # Priority: CUDA > CPU (MPS disabled for testing)
@@ -295,6 +310,7 @@ class TrainingApp(App):
         # Training progress
         self.current_batch = 0
         self.tokens_seen = 0
+        self.tokens_seen_at_start = 0  # Track tokens at session start for accurate tok/s
         self.current_lr = config.training.learning_rate
         self.start_time = time.time()
 
@@ -393,6 +409,8 @@ class TrainingApp(App):
                 self.optimizer,
                 self.device
             )
+            # Track starting tokens for accurate tok/s calculation
+            self.tokens_seen_at_start = self.tokens_seen
 
         # Create data loaders
         tokenizer = load_tokenizer(self.config.data.tokenizer_path)
@@ -447,6 +465,35 @@ class TrainingApp(App):
         self.inference_monitor.generate()
         self._update_inference_display()
 
+        # Initialize profiler if enabled
+        if self.enable_profiling:
+            self.profile_dir.mkdir(parents=True, exist_ok=True)
+
+            # Determine activities to profile based on device
+            activities = [ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(ProfilerActivity.CUDA)
+
+            # Create profiler schedule
+            profiler_schedule = schedule(
+                wait=self.profile_schedule['wait'],
+                warmup=self.profile_schedule['warmup'],
+                active=self.profile_schedule['active'],
+                repeat=self.profile_schedule['repeat']
+            )
+
+            # Create profiler with TensorBoard output
+            self.profiler = profile(
+                activities=activities,
+                schedule=profiler_schedule,
+                on_trace_ready=tensorboard_trace_handler(str(self.profile_dir)),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                with_flops=True
+            )
+            self.profiler.__enter__()
+
         # Start training
         self.is_training = True
 
@@ -459,43 +506,48 @@ class TrainingApp(App):
         if self.config.training.max_batches and self.current_batch >= self.config.training.max_batches:
             self.is_training = False
             self._save_checkpoint()
+            self._cleanup_profiler()
             return
 
         if self.config.training.max_tokens and self.tokens_seen >= self.config.training.max_tokens:
             self.is_training = False
             self._save_checkpoint()
+            self._cleanup_profiler()
             return
 
         # Get batch
-        try:
-            tokens, masks, labels = next(self.train_loader)
-        except StopIteration:
-            # Epoch complete, reset loader
-            self.train_loader.reset()
-            tokens, masks, labels = next(self.train_loader)
+        with record_function("data_loading"):
+            try:
+                tokens, masks, labels = next(self.train_loader)
+            except StopIteration:
+                # Epoch complete, reset loader
+                self.train_loader.reset()
+                tokens, masks, labels = next(self.train_loader)
 
         # Forward pass
-        self.model.train()
-        result = self.model(tokens, masks)
+        with record_function("forward"):
+            self.model.train()
+            result = self.model(tokens, masks)
 
         # Handle MoE models (return tuple) vs standard models (return tensor)
-        if isinstance(result, tuple):
-            logits, aux_losses = result
-        else:
-            logits = result
-            aux_losses = None
+        with record_function("loss_computation"):
+            if isinstance(result, tuple):
+                logits, aux_losses = result
+            else:
+                logits = result
+                aux_losses = None
 
-        # Compute main loss
-        loss = F.cross_entropy(
-            logits.view(-1, self.config.model.vocab_size),
-            labels.view(-1),
-            ignore_index=0
-        )
+            # Compute main loss
+            loss = F.cross_entropy(
+                logits.view(-1, self.config.model.vocab_size),
+                labels.view(-1),
+                ignore_index=0
+            )
 
-        # Add auxiliary losses if using MoE
-        if aux_losses is not None:
-            for aux_loss_name, aux_loss_value in aux_losses.items():
-                loss = loss + aux_loss_value
+            # Add auxiliary losses if using MoE
+            if aux_losses is not None:
+                for aux_loss_name, aux_loss_value in aux_losses.items():
+                    loss = loss + aux_loss_value
 
         # Check for NaN/Inf
         if not torch.isfinite(loss):
@@ -506,9 +558,9 @@ class TrainingApp(App):
             return
 
         # Backward pass
-        self.optimizer.zero_grad()
-
-        loss.backward()
+        with record_function("backward"):
+            self.optimizer.zero_grad()
+            loss.backward()
 
         # Check for gradient NaN/Inf after backward
         has_nan_grad = False
@@ -525,14 +577,16 @@ class TrainingApp(App):
             return
 
         # Gradient clipping
-        if self.config.training.grad_clip:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.config.training.grad_clip
-            )
+        with record_function("gradient_clipping"):
+            if self.config.training.grad_clip:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.training.grad_clip
+                )
 
         # Optimizer step
-        self.optimizer.step()
+        with record_function("optimizer_step"):
+            self.optimizer.step()
 
         # Update progress
         self.current_batch += 1
@@ -560,6 +614,10 @@ class TrainingApp(App):
         if self.current_batch % self.config.monitoring.inference_every_n_batches == 0:
             self.inference_monitor.generate()
             self._update_inference_display()
+
+        # Profiler step
+        if self.profiler is not None:
+            self.profiler.step()
 
     def _save_checkpoint(self, create_numbered: bool = False) -> None:
         """Save a checkpoint."""
@@ -648,15 +706,17 @@ class TrainingApp(App):
             return base_lr
         elif self.config.training.lr_schedule == "cosine":
             if self.config.training.max_batches:
-                progress = (self.current_batch - self.config.training.warmup_batches) / \
-                          (self.config.training.max_batches - self.config.training.warmup_batches)
+                # Handle edge case where warmup_batches >= max_batches
+                decay_batches = max(1, self.config.training.max_batches - self.config.training.warmup_batches)
+                progress = (self.current_batch - self.config.training.warmup_batches) / decay_batches
                 progress = min(1.0, max(0.0, progress))
                 return self.config.training.min_lr_ratio * base_lr + \
                        (1 - self.config.training.min_lr_ratio) * base_lr * 0.5 * (1 + math.cos(math.pi * progress))
         elif self.config.training.lr_schedule == "linear":
             if self.config.training.max_batches:
-                progress = (self.current_batch - self.config.training.warmup_batches) / \
-                          (self.config.training.max_batches - self.config.training.warmup_batches)
+                # Handle edge case where warmup_batches >= max_batches
+                decay_batches = max(1, self.config.training.max_batches - self.config.training.warmup_batches)
+                progress = (self.current_batch - self.config.training.warmup_batches) / decay_batches
                 progress = min(1.0, max(0.0, progress))
                 return base_lr * (1 - progress * (1 - self.config.training.min_lr_ratio))
 
@@ -758,7 +818,8 @@ class TrainingApp(App):
     def _update_metrics_bar(self) -> None:
         """Update metrics display bar."""
         elapsed = time.time() - self.start_time
-        tokens_per_sec = self.tokens_seen / elapsed if elapsed > 0 else 0
+        tokens_this_session = self.tokens_seen - self.tokens_seen_at_start
+        tokens_per_sec = tokens_this_session / elapsed if elapsed > 0 else 0
 
         current_train_loss = self.metrics_tracker.get_current_train_loss()
         current_val_loss = self.metrics_tracker.get_current_val_loss()
@@ -797,6 +858,24 @@ class TrainingApp(App):
             f"[bold cyan]Latest Generation:[/bold cyan]\n{output}"
         )
 
+    def _cleanup_profiler(self) -> None:
+        """Cleanup profiler and save memory snapshot if CUDA profiling was enabled."""
+        if self.profiler is not None:
+            self.profiler.__exit__(None, None, None)
+
+            # Save CUDA memory snapshot if available
+            if torch.cuda.is_available() and self.enable_profiling:
+                try:
+                    memory_snapshot_path = self.profile_dir / "cuda_memory_snapshot.pickle"
+                    torch.cuda.memory._dump_snapshot(str(memory_snapshot_path))
+                    print(f"\nCUDA memory snapshot saved to: {memory_snapshot_path}")
+                except Exception as e:
+                    print(f"\nWarning: Could not save CUDA memory snapshot: {e}")
+
+            print(f"\nProfiler traces saved to: {self.profile_dir}")
+            print(f"View with: tensorboard --logdir={self.profile_dir}")
+            self.profiler = None
+
     def action_toggle_pause(self) -> None:
         """Toggle training pause."""
         self.is_paused = not self.is_paused
@@ -815,6 +894,7 @@ class TrainingApp(App):
     def action_quit_training(self) -> None:
         """Quit and save."""
         self._save_checkpoint()
+        self._cleanup_profiler()
         self.should_quit = True
         self.exit()
 
@@ -833,6 +913,41 @@ def main():
         "--resume",
         type=str,
         help="Path to checkpoint to resume from"
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable PyTorch profiler for performance analysis"
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default="./profiling_logs",
+        help="Directory to save profiling results (default: ./profiling_logs)"
+    )
+    parser.add_argument(
+        "--profile-wait",
+        type=int,
+        default=5,
+        help="Number of steps to skip before profiling (default: 5)"
+    )
+    parser.add_argument(
+        "--profile-warmup",
+        type=int,
+        default=2,
+        help="Number of warmup steps for profiler (default: 2)"
+    )
+    parser.add_argument(
+        "--profile-active",
+        type=int,
+        default=3,
+        help="Number of steps to actively profile (default: 3)"
+    )
+    parser.add_argument(
+        "--profile-repeat",
+        type=int,
+        default=1,
+        help="Number of times to repeat profiling cycle (default: 1)"
     )
 
     args = parser.parse_args()
@@ -894,8 +1009,27 @@ def main():
     print("\nPress ENTER to start training...")
     input()
 
+    # Prepare profiling configuration
+    profile_schedule_config = None
+    if args.profile:
+        profile_schedule_config = {
+            'wait': args.profile_wait,
+            'warmup': args.profile_warmup,
+            'active': args.profile_active,
+            'repeat': args.profile_repeat
+        }
+        print(f"\n[PROFILING ENABLED]")
+        print(f"  Output: {args.profile_dir}")
+        print(f"  Schedule: wait={args.profile_wait}, warmup={args.profile_warmup}, active={args.profile_active}, repeat={args.profile_repeat}")
+
     # Run training app
-    app = TrainingApp(config, resume_checkpoint)
+    app = TrainingApp(
+        config,
+        resume_checkpoint,
+        enable_profiling=args.profile,
+        profile_dir=args.profile_dir,
+        profile_schedule=profile_schedule_config
+    )
     app.run()
 
 

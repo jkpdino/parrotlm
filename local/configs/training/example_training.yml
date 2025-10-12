@@ -1,0 +1,94 @@
+# Training Configuration Template
+# Copy this file and customize for your training run
+
+name: my_gpt_model # Name for this training run
+random_seed: 42 # Random seed for reproducibility
+
+# ============================================================================
+# MODEL ARCHITECTURE
+# ============================================================================
+model:
+  vocab_size: 16384 # Vocabulary size (must match tokenizer)
+  dim: 96 # Model dimension (embedding size)
+  depth: 16 # Number of transformer layers
+  n_heads: 6 # Number of query attention heads
+  n_kv_heads: 2 # Number of KV heads (GQA). Use n_heads for MHA
+  context_length: 512 # Maximum sequence length
+  dropout: 0.0 # Dropout probability (0.0 = no dropout)
+  ffn_hidden_mult: 4 # FFN hidden dimension multiplier (default: 4x)
+  pad_token_id: 0 # Padding token ID
+  rope_scaling_factor: 4.0 # RoPE cache scaling factor (allows extrapolation)
+  use_gradient_checkpointing: false # Enable to reduce memory (slower training)
+
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
+data:
+  dataset_path: "datasets/my_dataset/pretokenized/tokenizer" # Path to pretokenized data
+  tokenizer_path: "tokenizers/my_tokenizer/tokenizer.json" # Path to tokenizer
+  batch_size: 8 # Batch size (adjust based on GPU memory)
+  shuffle: true # Shuffle training data each epoch
+  num_workers: 0 # DataLoader workers (0 = single-threaded)
+
+# ============================================================================
+# TRAINING HYPERPARAMETERS
+# ============================================================================
+training:
+  learning_rate:
+    0.02 # Base learning rate
+    # Muon: typically 0.01-0.05
+    # AdamW: typically 0.0001-0.001
+
+  max_batches: 10000 # Maximum batches to train (null = unlimited)
+  max_tokens: null # Or specify max tokens instead (e.g., 1000000000 for 1B tokens)
+
+  optimizer:
+    "muon" # Optimizer: "muon" or "adamw"
+    # Muon: Better for transformers, higher LR
+    # AdamW: Standard choice, lower LR
+
+  warmup_batches: 500 # Linear warmup batches
+  weight_decay: 0.1 # Weight decay (L2 regularization)
+  grad_clip: 1.0 # Gradient clipping (null to disable)
+
+  lr_schedule:
+    "cosine" # Learning rate schedule
+    # "constant": No decay
+    # "cosine": Cosine annealing to min_lr_ratio
+    # "linear": Linear decay to min_lr_ratio
+
+  min_lr_ratio: 0.1 # Minimum LR as ratio of base LR (for cosine/linear)
+
+# ============================================================================
+# CHECKPOINTING
+# ============================================================================
+checkpointing:
+  save_every_n_batches: 100 # Save numbered checkpoint every N batches
+  keep_last_n: 10 # Keep only last N numbered checkpoints
+  output_dir:
+    "training_runs" # Base directory for all training runs
+    # Checkpoints saved to: {output_dir}/{name}/
+
+# ============================================================================
+# MONITORING AND VALIDATION
+# ============================================================================
+monitoring:
+  validate_every_n_batches: 100 # Run validation every N batches
+  validation_samples: 100 # Number of validation samples to use
+  inference_every_n_batches: 100 # Generate text sample every N batches
+  inference_prompt: "Once upon a time" # Prompt for sample generation
+  inference_max_tokens: 50 # Max tokens to generate in sample
+  inference_temperature: 1.0 # Temperature for sample generation
+  graph_window_size: 1000 # Number of recent points in loss graphs
+
+# ============================================================================
+# NOTES
+# ============================================================================
+# - Checkpoints are always saved to {output_dir}/{name}/last_checkpoint.pt
+# - Numbered checkpoints are saved every save_every_n_batches
+# - Training metrics are logged to {output_dir}/{name}/metrics.csv
+# - Use --resume flag to resume from a checkpoint
+# - Press SPACE during training to pause/resume
+# - Press S to save a checkpoint manually
+# - Press R to generate a new sample
+# - Press Q to quit and save

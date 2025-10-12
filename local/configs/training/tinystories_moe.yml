@@ -1,16 +1,16 @@
-# TinyStories GPT Training Configuration
-# Small model (~1.8M parameters) for training on TinyStories dataset
+# TinyStories GPT Training Configuration with MoE
+# MoE model with 16 experts, 2 active (~1.8M active parameters, ~12M total)
 
-name: tinystories_gpt_medium
+name: tinystories_gpt_moe
 random_seed: 42
 
-# Model architecture
+# Model architecture with MoE
 model:
   vocab_size: 16384 # Match your tokenizer vocab size
-  dim: 256 # Model dimension
-  depth: 24 # Number of transformer layers
-  n_heads: 16 # Number of query heads
-  n_kv_heads: 4 # Number of key/value heads (GQA: 3:1 ratio)
+  dim: 96 # Model dimension
+  depth: 16 # Number of transformer layers
+  n_heads: 6 # Number of query heads
+  n_kv_heads: 2 # Number of key/value heads (GQA: 3:1 ratio)
   context_length: 1024 # Maximum sequence length
   dropout: 0.0 # Dropout (modern LLMs use 0.0)
   ffn_hidden_mult: 4 # FFN hidden dimension multiplier
@@ -18,19 +18,27 @@ model:
   rope_scaling_factor: 4.0 # RoPE cache scaling factor
   use_gradient_checkpointing: false # Enable for larger models to save memory
 
+  # MoE (Mixture of Experts) configuration
+  use_moe: true # Enable MoE
+  num_experts: 64 # Total number of expert networks
+  num_experts_active: 2 # Number of experts activated per token (top-k)
+  moe_layers: null # Which layers use MoE (null = all layers, or specify list like [8, 9, 10, 11, 12, 13, 14, 15])
+  router_aux_loss_coef: 0.01 # Load balancing loss weight
+  router_z_loss_coef: 0.001 # Router z-loss weight (prevents extreme logits)
+
 # Data configuration
 data:
   dataset_path: "datasets/tinystories/pretokenized/tokenizer"
   tokenizer_path: "tokenizers/tinystories_tokenizer/tokenizer.json"
-  batch_size: 64 # Batch size (adjust based on GPU memory)
-  shuffle: false # Shuffle training data
+  batch_size: 128 # Batch size (adjust based on GPU memory)
+  shuffle: true # Shuffle training data
   num_workers: 0 # DataLoader workers (0 for single-threaded)
 
 # Training hyperparameters
 training:
   learning_rate: 0.003 # Learning rate (Muon works well with higher LR)
   max_batches: null # Maximum number of batches
-  max_tokens: 1000000000 # Or specify max tokens instead
+  max_tokens: 500000000 # Or specify max tokens instead
   optimizer: "adamw" # "muon" or "adamw"
   warmup_batches: 100 # Linear warmup batches
   weight_decay: 0.1 # Weight decay

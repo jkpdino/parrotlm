@@ -147,9 +147,21 @@ def generate_sample(
             )
             generation_time = time.time() - start_time
 
-            # Decode
-            generated_text = tokenizer.decode(output_ids[0].cpu().tolist())
-            token_count = len(output_ids[0])
+            # Decode tokens without adding spaces between them
+            output_tokens = output_ids[0].cpu().tolist()
+            token_count = len(output_tokens)
+
+            # Decode each token individually and concatenate without spaces
+            decoded_tokens = [tokenizer.decode([token_id]) for token_id in output_tokens]
+            generated_text = ''.join(decoded_tokens)
+
+            # Replace BPE placeholder characters with their actual representations
+            generated_text = generated_text.replace('Ġ', ' ')   # U+0120: space/word boundary
+            generated_text = generated_text.replace('Ċ', '\n')  # U+010A: newline
+            generated_text = generated_text.replace('Ĉ', '\n')  # U+0108: alternative newline marker
+            generated_text = generated_text.replace('ĉ', '\n')  # U+0109: lowercase alternative
+            generated_text = generated_text.replace('Č', '\r')  # U+010C: carriage return (rare)
+            generated_text = generated_text.replace('č', '\r')  # U+010D: lowercase alternative
 
             return generated_text, token_count, generation_time
 

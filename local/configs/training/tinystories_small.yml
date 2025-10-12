@@ -1,16 +1,16 @@
 # TinyStories GPT Training Configuration
 # Small model (~1.8M parameters) for training on TinyStories dataset
 
-name: tinystories_gpt_medium
+name: tinystories_gpt_small
 random_seed: 42
 
 # Model architecture
 model:
   vocab_size: 16384 # Match your tokenizer vocab size
-  dim: 256 # Model dimension
-  depth: 24 # Number of transformer layers
-  n_heads: 16 # Number of query heads
-  n_kv_heads: 4 # Number of key/value heads (GQA: 3:1 ratio)
+  dim: 160 # Model dimension
+  depth: 32 # Number of transformer layers
+  n_heads: 10 # Number of query heads
+  n_kv_heads: 5 # Number of key/value heads (GQA: 3:1 ratio)
   context_length: 1024 # Maximum sequence length
   dropout: 0.0 # Dropout (modern LLMs use 0.0)
   ffn_hidden_mult: 4 # FFN hidden dimension multiplier
@@ -22,15 +22,15 @@ model:
 data:
   dataset_path: "datasets/tinystories/pretokenized/tokenizer"
   tokenizer_path: "tokenizers/tinystories_tokenizer/tokenizer.json"
-  batch_size: 64 # Batch size (adjust based on GPU memory)
+  batch_size: 32 # Batch size (adjust based on GPU memory)
   shuffle: false # Shuffle training data
   num_workers: 0 # DataLoader workers (0 for single-threaded)
 
 # Training hyperparameters
 training:
   learning_rate: 0.003 # Learning rate (Muon works well with higher LR)
-  max_batches: null # Maximum number of batches
-  max_tokens: 1000000000 # Or specify max tokens instead
+  max_batches: 1000 # Maximum number of batches
+  max_tokens: null # Or specify max tokens instead
   optimizer: "adamw" # "muon" or "adamw"
   warmup_batches: 100 # Linear warmup batches
   weight_decay: 0.1 # Weight decay

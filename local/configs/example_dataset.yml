@@ -1,0 +1,44 @@
+# Example dataset configuration
+# This demonstrates how to configure a dataset with multiple slices
+
+key: example_dataset_v1
+name: example_dataset
+
+# Train/validation split ratios (must sum to 1.0)
+train_split: 0.8
+validation_split: 0.2
+
+# Random seed for reproducibility
+random_seed: 42
+
+# List of dataset slices
+slices:
+  # Slice 1: Load from HuggingFace datasets
+  - key: hf_sentiment_slice
+    huggingface: "imdb:train"  # Format: "dataset_name:split"
+    limit: 1000                # Optional: limit number of records
+    offset: 0                  # Optional: skip first N records
+    sampling: random           # Optional: "random" or "sequential" (default)
+
+  # Slice 2: Another HuggingFace dataset
+  - key: hf_reviews_slice
+    huggingface: "yelp_review_full:train"
+    limit: 500
+    sampling: sequential
+
+  # Slice 3: Load from local JSONL file
+  # - key: local_jsonl_slice
+  #   local: "/path/to/local/data.jsonl"
+  #   limit: 200
+  #   sampling: random
+
+  # Slice 4: Load from local CSV file
+  # - key: local_csv_slice
+  #   local: "/path/to/local/data.csv"
+  #   offset: 100
+  #   limit: 300
+
+  # Slice 5: Load from local Parquet file
+  # - key: local_parquet_slice
+  #   local: "/path/to/local/data.parquet"
+  #   sampling: sequential
