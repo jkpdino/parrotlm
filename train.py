@@ -26,7 +26,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
 from torch.profiler import profile, record_function, ProfilerActivity, schedule, tensorboard_trace_handler
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
@@ -303,7 +302,7 @@ class TrainingApp(App):
 
         # Mixed precision training (CUDA only for now)
         self.use_amp = torch.cuda.is_available()
-        self.scaler = GradScaler() if self.use_amp else None
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
 
         self.model: Optional[GPT] = None
         self.optimizer = None
@@ -555,7 +554,7 @@ class TrainingApp(App):
         self.model.train()
         with record_function("forward"):
             # Use autocast for CUDA mixed precision training
-            with autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
+            with torch.amp.autocast('cuda', dtype=torch.float16, enabled=self.use_amp):
                 result = self.model(tokens, masks)
 
                 # Handle MoE models (return tuple) vs standard models (return tensor)
