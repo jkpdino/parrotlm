@@ -264,12 +264,13 @@ def load_tokens(token_path: Path, mmap_mode: str = None) -> np.ndarray:
         if not token_path.exists():
             raise LoaderError(f"Token file not found: {token_path}")
 
-        # Check if it's a compressed NPZ file
         if token_path.suffix == '.npz':
-            # NPZ files cannot be memory-mapped
             with np.load(token_path) as data:
-                tokens = data['tokens']
-    return tokens
+                return data['tokens']
+        else:
+            return np.load(token_path, mmap_mode=mmap_mode)
+    except Exception as e:
+        raise LoaderError(f"Failed to load tokens from '{token_path}': {str(e)}")
 
 
 def tokenize_jsonl_to_npy(
