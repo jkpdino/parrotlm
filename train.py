@@ -308,6 +308,7 @@ class TrainingApp(App):
         self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
 
         self.model: Optional[GPT] = None
+        self.model_is_compiled = False  # Track if torch.compile succeeded
         self.optimizer = None
         self.checkpoint_manager: Optional[CheckpointManager] = None
         self.metrics_tracker: Optional[MetricsTracker] = None
@@ -398,7 +399,13 @@ class TrainingApp(App):
         # Compile model for 2-3x speedup
         if torch.cuda.is_available():
             print("Compiling model with torch.compile() - this takes ~1 minute...")
-            self.model = torch.compile(self.model)
+            try:
+                self.model = torch.compile(self.model)
+                self.model_is_compiled = True
+                print("✓ Model compilation successful!")
+            except Exception as e:
+                print(f"Warning: torch.compile failed ({e}), continuing without compilation")
+                self.model_is_compiled = False
         elif self.device.type == "mps":
             # Try compiling on MPS with workaround for macOS multiprocessing issue
             print("Compiling model for MPS (using eager backend to avoid subprocess issues)...")
@@ -410,10 +417,14 @@ class TrainingApp(App):
                     pass  # Already set
                 # Use eager backend which avoids the inductor subprocess issue
                 self.model = torch.compile(self.model, backend="aot_eager")
+                self.model_is_compiled = True
+                print("✓ Model compilation successful!")
             except Exception as e:
                 print(f"Warning: torch.compile failed on MPS ({e}), continuing without compilation")
+                self.model_is_compiled = False
         else:
             print(f"Skipping torch.compile on CPU (not beneficial)")
+            self.model_is_compiled = False
 
         # Create optimizer
         if self.config.training.optimizer == "muon":
@@ -994,6 +1005,16 @@ class TrainingApp(App):
 
         timing_str = " ".join(timing_parts) if timing_parts else "Measuring..."
 
+        # Build optimization flags
+        opt_flags = []
+        if self.model_is_compiled:
+            opt_flags.append("Compiled✓")
+        if self.use_amp:
+            opt_flags.append("FP16✓")
+        if not self.config.model.use_gradient_checkpointing:
+            opt_flags.append("NoGradCkpt✓")
+        opt_str = " ".join(opt_flags) if opt_flags else "No optimizations"
+
         metrics_text = (
             f"[bold {status_color}]{status}[/bold {status_color}] "
             f"[{device_name}] | "
@@ -1004,7 +1025,7 @@ class TrainingApp(App):
             f"Val Loss: {val_loss_str} | "
             f"LR: {self.current_lr:.6f} | "
             f"Speed: {tokens_per_sec:.0f} tok/s\n"
-            f"[dim]Timing: {timing_str}[/dim]"
+            f"[dim]Timing: {timing_str} | Opts: {opt_str}[/dim]"
         )
 
         self.query_one("#metrics-bar", Static).update(metrics_text)

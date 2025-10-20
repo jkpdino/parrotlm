@@ -16,7 +16,7 @@ model:
   ffn_hidden_mult: 4 # FFN hidden dimension multiplier
   pad_token_id: 0 # Padding token ID
   rope_scaling_factor: 1.0 # RoPE cache scaling factor
-  use_gradient_checkpointing: true # Enable for larger models to save memory
+  use_gradient_checkpointing: false # Disabled for speed (you have 24GB VRAM!)
 
 # Data configuration
 data:
