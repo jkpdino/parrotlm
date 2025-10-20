@@ -54,8 +54,14 @@ def generate_sample(
                 top_k=top_k,
                 top_p=top_p
             )
-            # Decode
+            # Decode and clean up special characters
             generated_text = tokenizer.decode(output_ids[0].cpu().tolist())
+
+            # Replace byte-level BPE markers with actual characters
+            # Ġ (U+0120) represents a space in GPT-2 style tokenizers
+            # Ċ (U+010A) represents a newline
+            generated_text = generated_text.replace('Ġ', ' ').replace('Ċ', '\n')
+
             return generated_text
         except (RuntimeError, ValueError) as e:
             # Handle NaN/Inf errors during generation

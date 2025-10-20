@@ -175,11 +175,19 @@ class CheckpointManager:
         if 'rng_state' in checkpoint:
             rng_state = checkpoint['rng_state']
             if rng_state.get('python') is not None:
-                torch.set_rng_state(rng_state['python'])
+                # Ensure RNG state is ByteTensor
+                python_state = rng_state['python']
+                if not isinstance(python_state, torch.ByteTensor):
+                    python_state = python_state.byte()
+                torch.set_rng_state(python_state)
             if rng_state.get('numpy') is not None:
                 torch.random.set_rng_state(rng_state['numpy'])
             if rng_state.get('cuda') is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(rng_state['cuda'])
+                # Ensure CUDA RNG states are ByteTensors
+                cuda_states = rng_state['cuda']
+                if isinstance(cuda_states, list):
+                    cuda_states = [s.byte() if not isinstance(s, torch.ByteTensor) else s for s in cuda_states]
+                torch.cuda.set_rng_state_all(cuda_states)
 
         return checkpoint
 
