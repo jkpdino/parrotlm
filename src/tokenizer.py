@@ -281,7 +281,8 @@ def tokenize_jsonl_to_npy(
     text_field: str = "text",
     add_eos: bool = True,
     batch_size: int = 4096,
-    tmp_dir: Optional[Path] = None
+    tmp_dir: Optional[Path] = None,
+    total_docs: Optional[int] = None
 ) -> dict:
     """
     Stream-tokenize a JSONL file and write tokens/offsets directly to NPY files
@@ -375,6 +376,9 @@ def tokenize_jsonl_to_npy(
                 total_tokens += cumsum
                 num_docs += len(lens)
 
+        # Progress bar over documents
+        pbar = tqdm(total=total_docs, unit='docs', desc=f"Tokenizing {jsonl_path.name}")
+
         for line in f_in:
             if not line.strip():
                 continue
@@ -386,11 +390,18 @@ def tokenize_jsonl_to_npy(
                 )
             texts.append(rec[text_field])
             if len(texts) >= batch_size:
+                if pbar is not None:
+                    pbar.update(len(texts))
                 _process_batch(texts)
                 texts = []
 
         if texts:
             _process_batch(texts)
+            if pbar is not None:
+                pbar.update(len(texts))
+
+        if pbar is not None:
+            pbar.close()
 
     # Convert tmp binaries to final NPY files
     # Tokens

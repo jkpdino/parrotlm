@@ -158,6 +158,20 @@ def main():
             print("Use --force to retokenize anyway.")
             return
 
+        # Load dataset stats for progress totals (if available)
+        stats_path = dataset_dir / "stats.json"
+        train_total_docs = None
+        val_total_docs = None
+        if stats_path.exists():
+            try:
+                import json as _json
+                with open(stats_path, 'r', encoding='utf-8') as sf:
+                    stats = _json.load(sf)
+                    train_total_docs = stats.get('train_records')
+                    val_total_docs = stats.get('validation_records')
+            except Exception:
+                pass
+
         # Load tokenizer
         print(f"{'='*60}")
         print("Loading tokenizer")
@@ -190,7 +204,8 @@ def main():
             train_offsets_output,
             text_field=args.text_field,
             add_eos=not args.no_eos,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            total_docs=train_total_docs
         )
 
         num_train_docs = train_info['num_docs']
@@ -211,7 +226,8 @@ def main():
             validation_offsets_output,
             text_field=args.text_field,
             add_eos=not args.no_eos,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            total_docs=val_total_docs
         )
 
         num_val_docs = val_info['num_docs']
