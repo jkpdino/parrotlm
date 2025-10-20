@@ -423,13 +423,6 @@ def tokenize_jsonl_to_npy(
         'offset_dtype': str(np.dtype(offset_dtype)),
         'eos_token_id': int(eos_token_id) if eos_token_id is not None else None,
     }
-        else:
-            # NPY files can be memory-mapped for efficient loading
-            tokens = np.load(token_path, mmap_mode=mmap_mode)
-            return tokens
-
-    except Exception as e:
-        raise LoaderError(f"Failed to load tokens from '{token_path}': {str(e)}")
 
 
 def load_document_tokens(
