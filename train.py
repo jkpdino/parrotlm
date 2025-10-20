@@ -332,7 +332,7 @@ class TrainingApp(App):
         self.timing_samples = 100  # Average over last N samples
         self.timings = {
             'data_loading': [],
-            'forward': [],
+            'model_forward': [],
             'loss_computation': [],
             'backward': [],
             'grad_check': [],
@@ -599,36 +599,37 @@ class TrainingApp(App):
         data_time = time.time() - data_start
 
         # Forward pass with mixed precision
-        forward_start = time.time()
         self.model.train()
 
-        # DIAGNOSTIC: Check if this is first forward pass (model compiling)
-        # First ~10 batches may be slower due to torch.compile warmup
-
+        # Model inference
+        model_forward_start = time.time()
         with record_function("forward"):
             # Use autocast for CUDA mixed precision training
             with torch.amp.autocast('cuda', dtype=torch.float16, enabled=self.use_amp):
                 result = self.model(tokens, masks)
+        model_forward_time = time.time() - model_forward_start
 
-                # Handle MoE models (return tuple) vs standard models (return tensor)
-                if isinstance(result, tuple):
-                    logits, aux_losses = result
-                else:
-                    logits = result
-                    aux_losses = None
+        # Handle MoE models (return tuple) vs standard models (return tensor)
+        loss_start = time.time()
+        if isinstance(result, tuple):
+            logits, aux_losses = result
+        else:
+            logits = result
+            aux_losses = None
 
-                # Compute main loss
-                loss = F.cross_entropy(
-                    logits.view(-1, self.config.model.vocab_size),
-                    labels.view(-1),
-                    ignore_index=0
-                )
+        # Compute main loss
+        with torch.amp.autocast('cuda', dtype=torch.float16, enabled=self.use_amp):
+            loss = F.cross_entropy(
+                logits.view(-1, self.config.model.vocab_size),
+                labels.view(-1),
+                ignore_index=0
+            )
 
-                # Add auxiliary losses if using MoE
-                if aux_losses is not None:
-                    for aux_loss_name, aux_loss_value in aux_losses.items():
-                        loss = loss + aux_loss_value
-        forward_time = time.time() - forward_start
+            # Add auxiliary losses if using MoE
+            if aux_losses is not None:
+                for aux_loss_name, aux_loss_value in aux_losses.items():
+                    loss = loss + aux_loss_value
+        loss_compute_time = time.time() - loss_start
 
         # Check for NaN/Inf
         if not torch.isfinite(loss):
@@ -706,9 +707,9 @@ class TrainingApp(App):
         self._set_lr(self.current_lr)
         lr_time = time.time() - lr_start
 
-        # Log metrics (only every 100 batches to reduce overhead - was every 10)
+        # Log metrics (only every 500 batches to reduce overhead - CSV write is slow)
         metrics_time = 0.0
-        if self.current_batch % 100 == 0:
+        if self.current_batch % 500 == 0:
             metrics_start = time.time()
             self.metrics_tracker.log(
                 batch=self.current_batch,
@@ -740,13 +741,14 @@ class TrainingApp(App):
             inference_time = time.time() - inf_start
 
         # Profiler step
-        if self.profiler is not None:
-            self.profiler.step()
+        # if self.profiler is not None:
+        #     self.profiler.step()
 
         # Record timings
         total_step_time = time.time() - step_start
         self._record_timing('data_loading', data_time)
-        self._record_timing('forward', forward_time)
+        self._record_timing('model_forward', model_forward_time)
+        self._record_timing('loss_computation', loss_compute_time)
         self._record_timing('backward', backward_time)
         self._record_timing('grad_check', grad_check_time)
         self._record_timing('grad_clip', grad_clip_time)
@@ -1012,7 +1014,8 @@ class TrainingApp(App):
         # Get timing breakdown
         avg_total = self._get_avg_timing('total_step')
         avg_data = self._get_avg_timing('data_loading')
-        avg_forward = self._get_avg_timing('forward')
+        avg_model_fwd = self._get_avg_timing('model_forward')
+        avg_loss = self._get_avg_timing('loss_computation')
         avg_backward = self._get_avg_timing('backward')
         avg_grad_check = self._get_avg_timing('grad_check')
         avg_grad_clip = self._get_avg_timing('grad_clip')
@@ -1023,7 +1026,7 @@ class TrainingApp(App):
         avg_inf = self._get_avg_timing('inference')
 
         # Calculate accounted time and overhead
-        accounted = avg_data + avg_forward + avg_backward + avg_grad_clip + avg_optim + avg_lr + avg_metrics
+        accounted = avg_data + avg_model_fwd + avg_loss + avg_backward + avg_grad_clip + avg_optim + avg_lr + avg_metrics
         overhead = avg_total - accounted if avg_total > accounted else 0
 
         # Build timing string (only show significant times)
@@ -1032,8 +1035,10 @@ class TrainingApp(App):
             timing_parts.append(f"Total:{avg_total:.1f}ms")
         if avg_data > 0:
             timing_parts.append(f"Data:{avg_data:.1f}ms")
-        if avg_forward > 0:
-            timing_parts.append(f"Fwd:{avg_forward:.1f}ms")
+        if avg_model_fwd > 0:
+            timing_parts.append(f"ModelFwd:{avg_model_fwd:.1f}ms")
+        if avg_loss > 0:
+            timing_parts.append(f"Loss:{avg_loss:.1f}ms")
         if avg_backward > 0:
             timing_parts.append(f"Bwd:{avg_backward:.1f}ms")
         if avg_grad_check > 1:
