@@ -1,0 +1,41 @@
+# FineWeb-Edu ~4B tokens (approximate) dataset configuration
+#
+# Notes:
+# - This uses the curated FineWeb-Edu corpus from Hugging Face. Adjust the
+#   dataset ID if your local mirror differs (commonly: "HuggingFaceFW/fineweb-edu").
+# - The "limit" below is a rough placeholder; the actual token count after
+#   tokenization depends on your tokenizer. Start with these values and
+#   measure tokens during pretokenization; increase/decrease as needed to
+#   reach ~4B tokens total.
+# - For very large datasets, the current processor materializes records to
+#   create a shuffled train/val split. For multi-billion-token scales, consider
+#   using sequential sampling per-slice and performing shuffling downstream
+#   (or splitting by time/hash) to avoid large in-memory materialization.
+
+key: fineweb_edu_4b
+name: fineweb_edu_4b
+
+# Train/validation split
+train_split: 0.995
+validation_split: 0.005
+
+random_seed: 42
+
+slices:
+  # Main FineWeb-Edu train split (streaming)
+  # Dataset path format: "<repo>:<split>"
+  - key: fineweb_edu_main
+    huggingface: "HuggingFaceFW/fineweb-edu:train"
+    sampling: random
+    # Rough cap to aim for ~4B tokens after tokenization. Tune as needed.
+    # Example: if avg ~500 tokens/doc ⇒ ~8M docs ≈ 4B tokens
+    # Set to null (remove) to stream entire dataset.
+    limit: 8000000
+
+  # Optional: add a small validation slice explicitly if desired (otherwise
+  # the split above will carve 0.5% into validation automatically)
+  # - key: fineweb_edu_val
+  #   huggingface: "HuggingFaceFW/fineweb-edu:validation"
+  #   sampling: sequential
+  #   limit: 20000
+
