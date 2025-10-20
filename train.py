@@ -19,6 +19,7 @@ Usage:
 import argparse
 import math
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -275,10 +276,12 @@ class TrainingApp(App):
         self.config = config
         self.resume_checkpoint = resume_checkpoint
 
-        # Training state
+        # Training state (accessed by both UI and training thread)
         self.is_paused = False
         self.is_training = False
         self.should_quit = False
+        self.training_thread: Optional[threading.Thread] = None
+        self.state_lock = threading.Lock()  # Lock for thread-safe state access
 
         # Profiling configuration
         self.enable_profiling = enable_profiling
@@ -347,9 +350,11 @@ class TrainingApp(App):
         # Update UI
         self.query_one("#metrics-bar", Static).update("Ready to train! Press SPACE to pause/resume")
 
-        # Start async training loop (runs at full GPU speed with periodic yields)
-        self.run_worker(self._training_loop())
-        # Update UI every second
+        # Start training in a background thread (runs at full GPU speed)
+        self.training_thread = threading.Thread(target=self._training_loop, daemon=True)
+        self.training_thread.start()
+
+        # Update UI every second (on main thread)
         self.set_interval(1.0, self._update_ui)
 
     async def _initialize_training(self) -> None:
@@ -530,13 +535,15 @@ class TrainingApp(App):
 
         # Check if we've reached max batches/tokens
         if self.config.training.max_batches and self.current_batch >= self.config.training.max_batches:
-            self.is_training = False
+            with self.state_lock:
+                self.is_training = False
             self._save_checkpoint()
             self._cleanup_profiler()
             return
 
         if self.config.training.max_tokens and self.tokens_seen >= self.config.training.max_tokens:
-            self.is_training = False
+            with self.state_lock:
+                self.is_training = False
             self._save_checkpoint()
             self._cleanup_profiler()
             return
@@ -578,8 +585,11 @@ class TrainingApp(App):
 
         # Check for NaN/Inf
         if not torch.isfinite(loss):
-            self.is_training = False
-            self.query_one("#metrics-bar", Static).update(
+            with self.state_lock:
+                self.is_training = False
+            # Safely update UI from training thread
+            self.call_from_thread(
+                self.query_one("#metrics-bar", Static).update,
                 "[bold red]TRAINING STOPPED: Loss became NaN/Inf. Try lowering learning rate.[/bold red]"
             )
             return
@@ -600,8 +610,11 @@ class TrainingApp(App):
                 break
 
         if has_nan_grad:
-            self.is_training = False
-            self.query_one("#metrics-bar", Static).update(
+            with self.state_lock:
+                self.is_training = False
+            # Safely update UI from training thread
+            self.call_from_thread(
+                self.query_one("#metrics-bar", Static).update,
                 "[bold red]TRAINING STOPPED: Gradients became NaN/Inf. Try lowering learning rate.[/bold red]"
             )
             return
@@ -650,35 +663,32 @@ class TrainingApp(App):
             self._run_validation()
 
         if self.current_batch % self.config.monitoring.inference_every_n_batches == 0:
+            # Generate inference and update display safely from training thread
             self.inference_monitor.generate()
-            self._update_inference_display()
+            self.call_from_thread(self._update_inference_display)
 
         # Profiler step
         if self.profiler is not None:
             self.profiler.step()
 
-    async def _training_loop(self) -> None:
-        """Main training loop that yields periodically to keep UI responsive."""
-        import asyncio
+    def _training_loop(self) -> None:
+        """Main training loop that runs in a background thread.
 
-        # Batches to process before yielding to event loop
-        # Adjust based on your batch speed - higher for faster batches
-        batches_per_yield = 50
-
-        while self.is_training and not self.should_quit:
-            # If paused, yield and wait
-            if self.is_paused:
-                await asyncio.sleep(0.1)
-                continue
-
-            # Run multiple batches in a tight loop
-            for _ in range(batches_per_yield):
-                if not self.is_training or self.is_paused or self.should_quit:
+        This runs continuously at full GPU speed while the UI updates
+        independently on the main thread.
+        """
+        while True:
+            with self.state_lock:
+                if self.should_quit:
                     break
-                self._do_single_training_step()
+                if self.is_paused or not self.is_training:
+                    time.sleep(0.01)  # Sleep when paused to avoid busy-waiting
+                    continue
 
-            # Yield to UI event loop (minimal overhead, ~1-10 microseconds)
-            await asyncio.sleep(0)
+            # Run a single training step at full GPU speed
+            self._do_single_training_step()
+
+            # No sleep needed - let GPU run at full speed!
 
     def _save_checkpoint(self, create_numbered: bool = False) -> None:
         """Save a checkpoint."""
@@ -939,7 +949,8 @@ class TrainingApp(App):
 
     def action_toggle_pause(self) -> None:
         """Toggle training pause."""
-        self.is_paused = not self.is_paused
+        with self.state_lock:
+            self.is_paused = not self.is_paused
 
     def action_save_checkpoint(self) -> None:
         """Manually save a checkpoint."""
@@ -954,9 +965,17 @@ class TrainingApp(App):
 
     def action_quit_training(self) -> None:
         """Quit and save."""
+        # Signal training thread to stop
+        with self.state_lock:
+            self.should_quit = True
+
+        # Wait for training thread to finish (with timeout)
+        if self.training_thread and self.training_thread.is_alive():
+            self.training_thread.join(timeout=5.0)
+
+        # Save final checkpoint and cleanup
         self._save_checkpoint()
         self._cleanup_profiler()
-        self.should_quit = True
         self.exit()
 
 
