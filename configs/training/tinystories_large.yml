@@ -37,6 +37,7 @@ training:
   grad_clip: 1.0 # Gradient clipping (null to disable)
   lr_schedule: "cosine" # "constant", "cosine", or "linear"
   min_lr_ratio: 0.1 # Minimum LR as ratio of base LR
+  accumulate_steps: 4 # Gradient accumulation to increase effective batch without extra memory
 
 # Checkpointing
 checkpointing:
@@ -46,9 +47,9 @@ checkpointing:
 
 # Monitoring and validation
 monitoring:
-  validate_every_n_batches: 100 # Run validation every N batches
-  validation_samples: 100 # Number of validation samples to evaluate
-  inference_every_n_batches: 50 # Generate sample every N batches
+  validate_every_n_batches: 1000 # Run validation every N batches (was 100 - validation is slow!)
+  validation_samples: 50 # Number of validation samples to evaluate (was 100)
+  inference_every_n_batches: 500 # Generate sample every N batches (was 50 - inference is slow!)
   inference_prompt: "Once upon a time" # Prompt for sample generation
   inference_max_tokens: 50 # Max tokens to generate
   inference_temperature: 1.0 # Sampling temperature

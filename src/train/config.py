@@ -112,6 +112,7 @@ class TrainingConfig:
     grad_clip: Optional[float] = 1.0
     lr_schedule: Literal["constant", "cosine", "linear"] = "constant"
     min_lr_ratio: float = 0.1
+    accumulate_steps: int = 1
 
     def __post_init__(self):
         """Validate training configuration."""
@@ -133,6 +134,8 @@ class TrainingConfig:
             raise ValidationError("grad_clip must be positive")
         if not 0.0 < self.min_lr_ratio <= 1.0:
             raise ValidationError("min_lr_ratio must be in range (0, 1]")
+        if self.accumulate_steps <= 0:
+            raise ValidationError("accumulate_steps must be positive")
 
 
 @dataclass
@@ -268,7 +271,8 @@ def load_training_config(config_path: str | Path) -> TrainingRunConfig:
         weight_decay=training_data.get('weight_decay', 0.1),
         grad_clip=training_data.get('grad_clip', 1.0),
         lr_schedule=training_data.get('lr_schedule', 'constant'),
-        min_lr_ratio=training_data.get('min_lr_ratio', 0.1)
+        min_lr_ratio=training_data.get('min_lr_ratio', 0.1),
+        accumulate_steps=training_data.get('accumulate_steps', 1)
     )
 
     # Parse checkpoint config
@@ -356,7 +360,8 @@ def save_training_config(config: TrainingRunConfig, output_path: str | Path) -> 
             'weight_decay': config.training.weight_decay,
             'grad_clip': config.training.grad_clip,
             'lr_schedule': config.training.lr_schedule,
-            'min_lr_ratio': config.training.min_lr_ratio
+            'min_lr_ratio': config.training.min_lr_ratio,
+            'accumulate_steps': config.training.accumulate_steps
         },
         'checkpointing': {
             'save_every_n_batches': config.checkpointing.save_every_n_batches,

@@ -360,6 +360,19 @@ class TrainingApp(App):
         # Priority: CUDA > MPS > CPU
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
+            # Speed knobs on CUDA devices (Ampere+): allow TF32 and use flash SDPA
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.set_float32_matmul_precision('high')
+                # Prefer flash attention kernels when available
+                try:
+                    from torch.backends.cuda import sdp_kernel, SDPBackend
+                    sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True)
+                except Exception:
+                    pass
+            except Exception:
+                pass
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             self.device = torch.device("mps")
         else:
@@ -384,6 +397,8 @@ class TrainingApp(App):
         self.tokens_seen_at_start = 0  # Track tokens at session start for accurate tok/s
         self.current_lr = config.training.learning_rate
         self.start_time = time.time()
+        self.accumulate_steps = max(1, self.config.training.accumulate_steps)
+        self.global_step = 0  # Counts optimizer steps (after accumulation)
 
         # Data prefetching (load next batch while GPU processes current)
         self.next_batch = None
@@ -631,7 +646,8 @@ class TrainingApp(App):
         self.is_training = True
 
         # Initialize CUDA prefetcher to overlap H->D copies with model compute
-        if torch.cuda.is_available() and self.device.type == "cuda":
+        import os
+        if torch.cuda.is_available() and self.device.type == "cuda" and os.getenv("DISABLE_CUDA_PREFETCH", "0") != "1":
             self.prefetcher = _CUDAPrefetcher(self.train_loader, self.device)
         else:
             self.prefetcher = None
@@ -735,11 +751,15 @@ class TrainingApp(App):
         # Backward pass with gradient scaling for mixed precision
         backward_start = time.time()
         with record_function("backward"):
-            self.optimizer.zero_grad()
+            # Gradient accumulation: zero only at start of accumulation window
+            if self.current_batch % self.accumulate_steps == 0:
+                self.optimizer.zero_grad(set_to_none=True)
+            # Scale loss by accumulation factor
+            loss_to_backprop = loss / self.accumulate_steps
             if self.use_amp:
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(loss_to_backprop).backward()
             else:
-                loss.backward()
+                loss_to_backprop.backward()
         backward_time = time.time() - backward_start
 
         # Check for gradient NaN/Inf after backward (disabled by default - loss check above catches most issues)
@@ -765,7 +785,7 @@ class TrainingApp(App):
 
         # Gradient clipping
         grad_clip_time = 0.0
-        if self.config.training.grad_clip:
+        if self.config.training.grad_clip and ((self.current_batch + 1) % self.accumulate_steps == 0):
             clip_start = time.time()
             with record_function("gradient_clipping"):
                 if self.use_amp:
@@ -780,11 +800,14 @@ class TrainingApp(App):
         # Optimizer step with gradient scaling
         optim_start = time.time()
         with record_function("optimizer_step"):
-            if self.use_amp:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
+            # Only step optimizer at end of accumulation window
+            if (self.current_batch + 1) % self.accumulate_steps == 0:
+                if self.use_amp:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                self.global_step += 1
         optim_time = time.time() - optim_start
 
         # Update progress
@@ -793,16 +816,18 @@ class TrainingApp(App):
 
         # Update learning rate
         lr_start = time.time()
-        self.current_lr = self._get_lr()
-        self._set_lr(self.current_lr)
+        if (self.current_batch % self.accumulate_steps) == 0:
+            self.current_lr = self._get_lr()
+            self._set_lr(self.current_lr)
         lr_time = time.time() - lr_start
 
         # Log metrics (only every 500 batches to reduce overhead - CSV write is slow)
         metrics_time = 0.0
-        if self.current_batch % 500 == 0:
+        # Log on optimizer steps boundary only
+        if (self.current_batch % self.accumulate_steps) == 0 and (self.global_step % 500 == 0):
             metrics_start = time.time()
             self.metrics_tracker.log(
-                batch=self.current_batch,
+                batch=self.global_step,
                 tokens_seen=self.tokens_seen,
                 train_loss=loss.item(),
                 learning_rate=self.current_lr
@@ -811,19 +836,19 @@ class TrainingApp(App):
 
         # Periodic tasks
         checkpoint_time = 0.0
-        if self.current_batch % self.config.checkpointing.save_every_n_batches == 0:
+        if (self.current_batch % self.accumulate_steps) == 0 and (self.global_step % self.config.checkpointing.save_every_n_batches == 0):
             ckpt_start = time.time()
             self._save_checkpoint(create_numbered=True)
             checkpoint_time = time.time() - ckpt_start
 
         validation_time = 0.0
-        if self.current_batch % self.config.monitoring.validate_every_n_batches == 0:
+        if (self.current_batch % self.accumulate_steps) == 0 and (self.global_step % self.config.monitoring.validate_every_n_batches == 0):
             val_start = time.time()
             self._run_validation()
             validation_time = time.time() - val_start
 
         inference_time = 0.0
-        if self.current_batch % self.config.monitoring.inference_every_n_batches == 0:
+        if (self.current_batch % self.accumulate_steps) == 0 and (self.global_step % self.config.monitoring.inference_every_n_batches == 0):
             # Generate inference and update display safely from training thread
             inf_start = time.time()
             self.inference_monitor.generate()
@@ -965,8 +990,8 @@ class TrainingApp(App):
         base_lr = self.config.training.learning_rate
 
         # Warmup
-        if self.current_batch < self.config.training.warmup_batches:
-            return base_lr * (self.current_batch + 1) / self.config.training.warmup_batches
+        if self.global_step < self.config.training.warmup_batches:
+            return base_lr * (self.global_step + 1) / self.config.training.warmup_batches
 
         # Main schedule
         if self.config.training.lr_schedule == "constant":
@@ -975,7 +1000,7 @@ class TrainingApp(App):
             if self.config.training.max_batches:
                 # Handle edge case where warmup_batches >= max_batches
                 decay_batches = max(1, self.config.training.max_batches - self.config.training.warmup_batches)
-                progress = (self.current_batch - self.config.training.warmup_batches) / decay_batches
+                progress = (self.global_step - self.config.training.warmup_batches) / decay_batches
                 progress = min(1.0, max(0.0, progress))
                 return self.config.training.min_lr_ratio * base_lr + \
                        (1 - self.config.training.min_lr_ratio) * base_lr * 0.5 * (1 + math.cos(math.pi * progress))
@@ -983,7 +1008,7 @@ class TrainingApp(App):
             if self.config.training.max_batches:
                 # Handle edge case where warmup_batches >= max_batches
                 decay_batches = max(1, self.config.training.max_batches - self.config.training.warmup_batches)
-                progress = (self.current_batch - self.config.training.warmup_batches) / decay_batches
+                progress = (self.global_step - self.config.training.warmup_batches) / decay_batches
                 progress = min(1.0, max(0.0, progress))
                 return base_lr * (1 - progress * (1 - self.config.training.min_lr_ratio))
 
@@ -1118,6 +1143,8 @@ class TrainingApp(App):
         avg_val = self._get_avg_timing('validation')
         avg_inf = self._get_avg_timing('inference')
         avg_compute = self._get_avg_timing('compute_only')
+        # Derive 'other' compute (kernel launches, Python overhead, syncs)
+        avg_other = max(0.0, avg_compute - (avg_data + avg_model_fwd + avg_loss + avg_backward + avg_grad_clip + avg_optim + avg_lr))
 
         # Calculate accounted time and overhead
         accounted = avg_data + avg_model_fwd + avg_loss + avg_backward + avg_grad_clip + avg_optim + avg_lr + avg_metrics
@@ -1129,6 +1156,8 @@ class TrainingApp(App):
             timing_parts.append(f"Total:{avg_total:.1f}ms")
         if avg_compute > 0:
             timing_parts.append(f"Compute:{avg_compute:.1f}ms")
+        if avg_other > 1:
+            timing_parts.append(f"Other:{avg_other:.1f}ms")
         if avg_data > 0:
             timing_parts.append(f"Data:{avg_data:.1f}ms")
         if avg_model_fwd > 0:
