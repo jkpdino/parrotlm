@@ -338,6 +338,8 @@ class TrainingApp(App):
             'grad_check': [],
             'grad_clip': [],
             'optimizer_step': [],
+            'lr_update': [],
+            'metrics_log': [],
             'validation': [],
             'inference': [],
             'checkpoint': [],
@@ -695,17 +697,22 @@ class TrainingApp(App):
         self.tokens_seen += tokens.numel()
 
         # Update learning rate
+        lr_start = time.time()
         self.current_lr = self._get_lr()
         self._set_lr(self.current_lr)
+        lr_time = time.time() - lr_start
 
         # Log metrics (only every 10 batches to reduce overhead)
+        metrics_time = 0.0
         if self.current_batch % 10 == 0:
+            metrics_start = time.time()
             self.metrics_tracker.log(
                 batch=self.current_batch,
                 tokens_seen=self.tokens_seen,
                 train_loss=loss.item(),
                 learning_rate=self.current_lr
             )
+            metrics_time = time.time() - metrics_start
 
         # Periodic tasks
         checkpoint_time = 0.0
@@ -740,6 +747,8 @@ class TrainingApp(App):
         self._record_timing('grad_check', grad_check_time)
         self._record_timing('grad_clip', grad_clip_time)
         self._record_timing('optimizer_step', optim_time)
+        self._record_timing('lr_update', lr_time)
+        self._record_timing('metrics_log', metrics_time)
         self._record_timing('validation', validation_time)
         self._record_timing('inference', inference_time)
         self._record_timing('checkpoint', checkpoint_time)
@@ -1004,8 +1013,14 @@ class TrainingApp(App):
         avg_grad_check = self._get_avg_timing('grad_check')
         avg_grad_clip = self._get_avg_timing('grad_clip')
         avg_optim = self._get_avg_timing('optimizer_step')
+        avg_lr = self._get_avg_timing('lr_update')
+        avg_metrics = self._get_avg_timing('metrics_log')
         avg_val = self._get_avg_timing('validation')
         avg_inf = self._get_avg_timing('inference')
+
+        # Calculate accounted time and overhead
+        accounted = avg_data + avg_forward + avg_backward + avg_grad_clip + avg_optim + avg_lr + avg_metrics
+        overhead = avg_total - accounted if avg_total > accounted else 0
 
         # Build timing string (only show significant times)
         timing_parts = []
@@ -1023,6 +1038,12 @@ class TrainingApp(App):
             timing_parts.append(f"GradClip:{avg_grad_clip:.1f}ms")
         if avg_optim > 0:
             timing_parts.append(f"Opt:{avg_optim:.1f}ms")
+        if avg_lr > 0.5:
+            timing_parts.append(f"LR:{avg_lr:.1f}ms")
+        if avg_metrics > 0.5:
+            timing_parts.append(f"Metrics:{avg_metrics:.1f}ms")
+        if overhead > 1:
+            timing_parts.append(f"[yellow]Overhead:{overhead:.1f}ms[/yellow]")
         if avg_val > 1:  # Only show if > 1ms
             timing_parts.append(f"Val:{avg_val:.0f}ms")
         if avg_inf > 1:  # Only show if > 1ms
