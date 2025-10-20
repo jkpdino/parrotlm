@@ -61,6 +61,98 @@ def create_train_validation_split_streaming(
     return train_data, validation_data
 
 
+def save_dataset_streaming(
+    dataset_config: DatasetConfig,
+    data_iterator: Iterator[Dict],
+    output_dir: str | Path = "datasets"
+) -> Path:
+    """
+    Stream data directly into train/validation JSONL files without materializing
+    the entire dataset. Splits sequentially according to train_split.
+
+    Args:
+        dataset_config: Dataset configuration (uses train_split/validation_split)
+        data_iterator: Iterator yielding data records
+        output_dir: Base directory for saving datasets
+
+    Returns:
+        Path to the created dataset directory
+    """
+    output_dir = Path(output_dir)
+    dataset_dir = output_dir / dataset_config.name
+
+    train_dir = dataset_dir / "train"
+    validation_dir = dataset_dir / "validation"
+
+    train_dir.mkdir(parents=True, exist_ok=True)
+    validation_dir.mkdir(parents=True, exist_ok=True)
+
+    train_path = train_dir / "data.jsonl"
+    val_path = validation_dir / "data.jsonl"
+
+    total = 0
+    train_count = 0
+    val_count = 0
+
+    # Write sequentially according to split ratio
+    with open(train_path, 'w', encoding='utf-8') as ft, open(val_path, 'w', encoding='utf-8') as fv:
+        # We can't know total upfront; we stream and fill train portion until threshold,
+        # then write remaining to validation.
+        # To maintain the requested ratio approximately, we first buffer count? Instead,
+        # we will write the first k items to train where k ~= ratio * N. Since N unknown,
+        # we implement a periodic assignment using reservoir method approximation:
+        # For simplicity and stability, write first chunk to train up to a rolling threshold.
+        # Here, do a simple phase split: write to train until a target count is reached
+        # based on observed total; for streaming simplicity, we instead use a fixed window
+        # approach: write first 100%*train_split of each block of size B to train.
+
+        block_size = 10000
+        block_seen = 0
+        block_train_target = int(block_size * dataset_config.train_split)
+        block_train_written = 0
+
+        for record in data_iterator:
+            total += 1
+            block_seen += 1
+
+            line = json.dumps(record, ensure_ascii=False) + "\n"
+
+            # Within each block, send first portion to train, rest to validation
+            if block_train_written < block_train_target:
+                ft.write(line)
+                train_count += 1
+                block_train_written += 1
+            else:
+                fv.write(line)
+                val_count += 1
+
+            if block_seen >= block_size:
+                block_seen = 0
+                block_train_written = 0
+
+    # Save dataset statistics
+    stats = {
+        "dataset_name": dataset_config.name,
+        "dataset_key": dataset_config.key,
+        "total_records": total,
+        "train_records": train_count,
+        "validation_records": val_count,
+        "train_split": dataset_config.train_split,
+        "validation_split": dataset_config.validation_split,
+        "num_slices": len(dataset_config.slices),
+        "split_strategy": getattr(dataset_config, 'split_strategy', 'sequential'),
+    }
+
+    stats_path = dataset_dir / "stats.json"
+    with open(stats_path, 'w', encoding='utf-8') as f:
+        json.dump(stats, f, indent=2)
+
+    print(f"Saved {train_count} training records to {train_path}")
+    print(f"Saved {val_count} validation records to {val_path}")
+
+    return dataset_dir
+
+
 def save_dataset(
     dataset_config: DatasetConfig,
     train_data: List[Dict],

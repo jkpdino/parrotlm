@@ -28,6 +28,7 @@ from src.processor import (
     create_train_validation_split_streaming,
     merge_slices_streaming,
     save_dataset,
+    save_dataset_streaming,
 )
 
 
@@ -102,32 +103,39 @@ def main():
         print("Slices merged into unified stream")
 
         # Create train/validation split
-        # Note: This step requires materializing data for shuffling
         print(f"\n{'='*60}")
         print("Creating train/validation split")
         print(f"{'='*60}\n")
 
-        print("Materializing stream for train/val split (required for shuffling)...")
-        train_data, validation_data = create_train_validation_split_streaming(
-            merged_stream,
-            train_split=config.train_split,
-            random_seed=config.random_seed
-        )
+        if getattr(config, 'split_strategy', 'shuffle') == 'sequential':
+            print("Using sequential split: streaming directly to disk (no full materialization)")
+            dataset_dir = save_dataset_streaming(
+                config,
+                merged_stream,
+                output_dir=args.output_dir
+            )
+        else:
+            print("Materializing stream for shuffled split (requires memory)...")
+            train_data, validation_data = create_train_validation_split_streaming(
+                merged_stream,
+                train_split=config.train_split,
+                random_seed=config.random_seed
+            )
 
-        print(f"Training records: {len(train_data)}")
-        print(f"Validation records: {len(validation_data)}")
+            print(f"Training records: {len(train_data)}")
+            print(f"Validation records: {len(validation_data)}")
 
-        # Save dataset
-        print(f"\n{'='*60}")
-        print("Saving dataset")
-        print(f"{'='*60}\n")
+            # Save dataset
+            print(f"\n{'='*60}")
+            print("Saving dataset")
+            print(f"{'='*60}\n")
 
-        dataset_dir = save_dataset(
-            config,
-            train_data,
-            validation_data,
-            output_dir=args.output_dir
-        )
+            dataset_dir = save_dataset(
+                config,
+                train_data,
+                validation_data,
+                output_dir=args.output_dir
+            )
 
         # Success summary
         print(f"\n{'='*60}")

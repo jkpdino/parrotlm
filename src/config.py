@@ -47,6 +47,7 @@ class DatasetConfig:
     slices: List[SliceConfig]
     train_split: float = 0.8
     validation_split: float = 0.2
+    split_strategy: Literal["shuffle", "sequential"] = "shuffle"
     random_seed: int = 42
 
     def __post_init__(self):
@@ -68,6 +69,8 @@ class DatasetConfig:
 
         if abs(self.train_split + self.validation_split - 1.0) > 1e-6:
             raise ValidationError("train_split and validation_split must sum to 1.0")
+        if self.split_strategy not in ["shuffle", "sequential"]:
+            raise ValidationError("split_strategy must be 'shuffle' or 'sequential'")
 
 
 def load_config(config_path: str | Path) -> DatasetConfig:
@@ -117,7 +120,8 @@ def load_config(config_path: str | Path) -> DatasetConfig:
         slices=slices,
         train_split=data.get('train_split', 0.8),
         validation_split=data.get('validation_split', 0.2),
-        random_seed=data.get('random_seed', 42)
+        random_seed=data.get('random_seed', 42),
+        split_strategy=data.get('split_strategy', 'shuffle')
     )
 
     return dataset_config

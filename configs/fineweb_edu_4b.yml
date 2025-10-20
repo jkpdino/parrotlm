@@ -26,7 +26,7 @@ slices:
   # Dataset path format: "<repo>:<split>"
   - key: fineweb_edu_main
     huggingface: "HuggingFaceFW/fineweb-edu:train"
-    sampling: random
+    sampling: sequential
     # Rough cap to aim for ~4B tokens after tokenization. Tune as needed.
     # Example: if avg ~500 tokens/doc ⇒ ~8M docs ≈ 4B tokens
     # Set to null (remove) to stream entire dataset.
@@ -38,4 +38,3 @@ slices:
   #   huggingface: "HuggingFaceFW/fineweb-edu:validation"
   #   sampling: sequential
   #   limit: 20000
-

@@ -6,7 +6,7 @@ random_seed: 42
 
 # Model architecture
 model:
-  vocab_size: 32768 # Match your tokenizer vocab size
+  vocab_size: 32000 # LLaMA 2 vocab size
   dim: 768 # Model dimension
   depth: 16 # Number of transformer layers
   n_heads: 16 # Number of query heads
@@ -21,7 +21,7 @@ model:
 # Data configuration
 data:
   dataset_path: "datasets/fineweb_edu_4b/pretokenized/tokenizer" # Update if you use a different output path
-  tokenizer_path: "tokenizers/tinystories_tokenizer/tokenizer.json" # Replace if you trained a FineWeb tokenizer
+  tokenizer_path: "meta-llama/Llama-2-7b-hf" # Use LLaMA 2 7B tokenizer from HF Hub
   batch_size: 64 # Adjust based on GPU memory; use accumulate_steps if needed
   shuffle: false
   num_workers: 0
@@ -54,4 +54,3 @@ monitoring:
   inference_max_tokens: 50
   inference_temperature: 1.0
   graph_window_size: 1000
-
