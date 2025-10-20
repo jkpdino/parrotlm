@@ -247,7 +247,7 @@ class TrainingApp(App):
     }
 
     #metrics-bar {
-        height: 5;
+        height: 6;
         dock: bottom;
         border: solid green;
     }
@@ -321,6 +321,20 @@ class TrainingApp(App):
         self.tokens_seen_at_start = 0  # Track tokens at session start for accurate tok/s
         self.current_lr = config.training.learning_rate
         self.start_time = time.time()
+
+        # Performance timing diagnostics
+        self.timing_samples = 100  # Average over last N samples
+        self.timings = {
+            'data_loading': [],
+            'forward': [],
+            'loss_computation': [],
+            'backward': [],
+            'optimizer_step': [],
+            'validation': [],
+            'inference': [],
+            'checkpoint': [],
+            'total_step': []
+        }
 
     def compose(self) -> ComposeResult:
         """Create child widgets for training console."""
@@ -530,6 +544,8 @@ class TrainingApp(App):
 
     def _do_single_training_step(self) -> None:
         """Execute one training step (synchronous)."""
+        step_start = time.time()
+
         if not self.is_training or self.is_paused or self.should_quit:
             return
 
@@ -549,6 +565,7 @@ class TrainingApp(App):
             return
 
         # Get batch
+        data_start = time.time()
         with record_function("data_loading"):
             try:
                 tokens, masks, labels = next(self.train_loader)
@@ -556,8 +573,10 @@ class TrainingApp(App):
                 # Epoch complete, reset loader
                 self.train_loader.reset()
                 tokens, masks, labels = next(self.train_loader)
+        data_time = time.time() - data_start
 
         # Forward pass with mixed precision
+        forward_start = time.time()
         self.model.train()
         with record_function("forward"):
             # Use autocast for CUDA mixed precision training
@@ -582,6 +601,7 @@ class TrainingApp(App):
                 if aux_losses is not None:
                     for aux_loss_name, aux_loss_value in aux_losses.items():
                         loss = loss + aux_loss_value
+        forward_time = time.time() - forward_start
 
         # Check for NaN/Inf
         if not torch.isfinite(loss):
@@ -595,6 +615,7 @@ class TrainingApp(App):
             return
 
         # Backward pass with gradient scaling for mixed precision
+        backward_start = time.time()
         with record_function("backward"):
             self.optimizer.zero_grad()
             if self.use_amp:
@@ -629,14 +650,17 @@ class TrainingApp(App):
                     self.model.parameters(),
                     self.config.training.grad_clip
                 )
+        backward_time = time.time() - backward_start
 
         # Optimizer step with gradient scaling
+        optim_start = time.time()
         with record_function("optimizer_step"):
             if self.use_amp:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 self.optimizer.step()
+        optim_time = time.time() - optim_start
 
         # Update progress
         self.current_batch += 1
@@ -656,20 +680,54 @@ class TrainingApp(App):
             )
 
         # Periodic tasks
+        checkpoint_time = 0.0
         if self.current_batch % self.config.checkpointing.save_every_n_batches == 0:
+            ckpt_start = time.time()
             self._save_checkpoint(create_numbered=True)
+            checkpoint_time = time.time() - ckpt_start
 
+        validation_time = 0.0
         if self.current_batch % self.config.monitoring.validate_every_n_batches == 0:
+            val_start = time.time()
             self._run_validation()
+            validation_time = time.time() - val_start
 
+        inference_time = 0.0
         if self.current_batch % self.config.monitoring.inference_every_n_batches == 0:
             # Generate inference and update display safely from training thread
+            inf_start = time.time()
             self.inference_monitor.generate()
             self.call_from_thread(self._update_inference_display)
+            inference_time = time.time() - inf_start
 
         # Profiler step
         if self.profiler is not None:
             self.profiler.step()
+
+        # Record timings
+        total_step_time = time.time() - step_start
+        self._record_timing('data_loading', data_time)
+        self._record_timing('forward', forward_time)
+        self._record_timing('backward', backward_time)
+        self._record_timing('optimizer_step', optim_time)
+        self._record_timing('validation', validation_time)
+        self._record_timing('inference', inference_time)
+        self._record_timing('checkpoint', checkpoint_time)
+        self._record_timing('total_step', total_step_time)
+
+    def _record_timing(self, category: str, duration: float) -> None:
+        """Record timing for a category, keeping only last N samples."""
+        if duration > 0:  # Only record non-zero times
+            self.timings[category].append(duration)
+            # Keep only last N samples
+            if len(self.timings[category]) > self.timing_samples:
+                self.timings[category].pop(0)
+
+    def _get_avg_timing(self, category: str) -> float:
+        """Get average timing for a category in milliseconds."""
+        if not self.timings[category]:
+            return 0.0
+        return sum(self.timings[category]) / len(self.timings[category]) * 1000  # Convert to ms
 
     def _training_loop(self) -> None:
         """Main training loop that runs in a background thread.
@@ -908,6 +966,34 @@ class TrainingApp(App):
         train_loss_str = f"{current_train_loss:.4f}" if current_train_loss is not None else "N/A"
         val_loss_str = f"{current_val_loss:.4f}" if current_val_loss is not None else "N/A"
 
+        # Get timing breakdown
+        avg_total = self._get_avg_timing('total_step')
+        avg_data = self._get_avg_timing('data_loading')
+        avg_forward = self._get_avg_timing('forward')
+        avg_backward = self._get_avg_timing('backward')
+        avg_optim = self._get_avg_timing('optimizer_step')
+        avg_val = self._get_avg_timing('validation')
+        avg_inf = self._get_avg_timing('inference')
+
+        # Build timing string (only show significant times)
+        timing_parts = []
+        if avg_total > 0:
+            timing_parts.append(f"Total:{avg_total:.1f}ms")
+        if avg_data > 0:
+            timing_parts.append(f"Data:{avg_data:.1f}ms")
+        if avg_forward > 0:
+            timing_parts.append(f"Fwd:{avg_forward:.1f}ms")
+        if avg_backward > 0:
+            timing_parts.append(f"Bwd:{avg_backward:.1f}ms")
+        if avg_optim > 0:
+            timing_parts.append(f"Opt:{avg_optim:.1f}ms")
+        if avg_val > 1:  # Only show if > 1ms
+            timing_parts.append(f"Val:{avg_val:.0f}ms")
+        if avg_inf > 1:  # Only show if > 1ms
+            timing_parts.append(f"Inf:{avg_inf:.0f}ms")
+
+        timing_str = " ".join(timing_parts) if timing_parts else "Measuring..."
+
         metrics_text = (
             f"[bold {status_color}]{status}[/bold {status_color}] "
             f"[{device_name}] | "
@@ -917,7 +1003,8 @@ class TrainingApp(App):
             f"Train Loss: {train_loss_str} | "
             f"Val Loss: {val_loss_str} | "
             f"LR: {self.current_lr:.6f} | "
-            f"Speed: {tokens_per_sec:.0f} tok/s"
+            f"Speed: {tokens_per_sec:.0f} tok/s\n"
+            f"[dim]Timing: {timing_str}[/dim]"
         )
 
         self.query_one("#metrics-bar", Static).update(metrics_text)
