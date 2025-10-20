@@ -20,6 +20,7 @@ train_split: 0.995
 validation_split: 0.005
 
 random_seed: 42
+split_strategy: sequential
 
 slices:
   # Main FineWeb-Edu train split (streaming)
