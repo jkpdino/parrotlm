@@ -43,6 +43,68 @@ from src.train.muon import Muon, create_hybrid_optimizer, HybridOptimizer
 from src.train.pipeline import DocumentBatchLoader
 
 
+class _CUDAPrefetcher:
+    """Double-buffered CUDA prefetcher using a dedicated stream for H2D copies.
+
+    Wraps an iterator that yields CPU tensors and preloads the next batch to GPU
+    asynchronously so H2D transfer overlaps with model compute on the default stream.
+    """
+
+    def __init__(self, loader: DocumentBatchLoader, device: torch.device):
+        assert torch.cuda.is_available() and device.type == "cuda"
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self.iterator = iter(loader)
+        self._next_batch = None
+        self._preload()
+
+    def reset(self) -> None:
+        """Reset the underlying loader and iterator, then preload next batch."""
+        self.loader.reset()
+        self.iterator = iter(self.loader)
+        self._next_batch = None
+        self._preload()
+
+    def _move_to_device(self, t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if t is None:
+            return None
+        # Pin if on CPU to enable non_blocking copies
+        if t.device.type == 'cpu':
+            try:
+                t = t.pin_memory()
+            except RuntimeError:
+                # Pinning can fail on some systems; fall back gracefully
+                pass
+            return t.to(self.device, non_blocking=True)
+        return t
+
+    def _preload(self) -> None:
+        try:
+            tokens, masks, labels = next(self.iterator)
+        except StopIteration:
+            self._next_batch = None
+            return
+
+        # Enqueue H2D on the prefetch stream
+        with torch.cuda.stream(self.stream):
+            tokens = self._move_to_device(tokens)
+            masks = self._move_to_device(masks)
+            labels = self._move_to_device(labels)
+
+        self._next_batch = (tokens, masks, labels)
+
+    def next(self):
+        if self._next_batch is None:
+            raise StopIteration
+        # Ensure current stream waits for prefetch stream
+        torch.cuda.current_stream(self.device).wait_stream(self.stream)
+        batch = self._next_batch
+        # Immediately preload the following batch
+        self._preload()
+        return batch
+
+
 class ConfigReviewScreen(Static):
     """Screen showing configuration details before training starts."""
 
@@ -346,6 +408,9 @@ class TrainingApp(App):
             'total_step': []
         }
 
+        # CUDA prefetcher (set during initialization when on CUDA)
+        self.prefetcher = None
+
     def compose(self) -> ComposeResult:
         """Create child widgets for training console."""
         yield Header()
@@ -488,7 +553,7 @@ class TrainingApp(App):
         bos_token_id = tokenizer.token_to_id("<|bos|>")
         eos_token_id = tokenizer.token_to_id("<|eos|>")
 
-        # Training loader
+        # Training loader (keep on CPU so we can overlap H2D with compute via CUDA prefetcher)
         self.train_loader = DocumentBatchLoader(
             tokens_path=str(dataset_path / "train.npy"),
             offsets_path=str(dataset_path / "train_offsets.npy"),
@@ -499,7 +564,7 @@ class TrainingApp(App):
             eos_token_id=eos_token_id,
             shuffle=self.config.data.shuffle,
             return_labels=True,
-            device=self.device,
+            device=None,  # keep CPU tensors; we'll move to CUDA asynchronously
             return_masks=False  # TEMP: Disable to test Flash Attention
         )
 
@@ -564,6 +629,12 @@ class TrainingApp(App):
         # Start training
         self.is_training = True
 
+        # Initialize CUDA prefetcher to overlap H->D copies with model compute
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            self.prefetcher = _CUDAPrefetcher(self.train_loader, self.device)
+        else:
+            self.prefetcher = None
+
     def _do_single_training_step(self) -> None:
         """Execute one training step (synchronous)."""
         step_start = time.time()
@@ -586,16 +657,24 @@ class TrainingApp(App):
             self._cleanup_profiler()
             return
 
-        # Get batch - just load synchronously for now
-        # TODO: Implement proper async prefetching with background thread
+        # Get batch (overlap H2D transfers on CUDA with compute using prefetcher)
         data_start = time.time()
         with record_function("data_loading"):
-            try:
-                tokens, masks, labels = next(self.train_loader)
-            except StopIteration:
-                # Epoch complete, reset loader
-                self.train_loader.reset()
-                tokens, masks, labels = next(self.train_loader)
+            if self.prefetcher is not None:
+                try:
+                    tokens, masks, labels = self.prefetcher.next()
+                except StopIteration:
+                    # Epoch complete, reset
+                    self.train_loader.reset()
+                    self.prefetcher.reset()
+                    tokens, masks, labels = self.prefetcher.next()
+            else:
+                try:
+                    tokens, masks, labels = next(self.train_loader)
+                except StopIteration:
+                    # Epoch complete, reset loader
+                    self.train_loader.reset()
+                    tokens, masks, labels = next(self.train_loader)
         data_time = time.time() - data_start
 
         # Forward pass with mixed precision
