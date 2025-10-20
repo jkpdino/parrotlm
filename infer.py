@@ -83,8 +83,11 @@ def load_model_from_checkpoint(
     print(f"Loading checkpoint from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    # Load model weights
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Load model weights with compatibility for checkpoints saved from torch.compile() models
+    state_dict = checkpoint['model_state_dict']
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.eval()
 
     # Print checkpoint info

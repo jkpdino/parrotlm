@@ -97,6 +97,9 @@ class CheckpointManager:
         import datetime
 
         # Prepare checkpoint data
+        # Get a clean state_dict even if model is torch.compile()'d (which wraps as _orig_mod)
+        base_model = getattr(model, "_orig_mod", model)
+
         checkpoint = {
             'batch_num': batch_num,
             'tokens_seen': tokens_seen,
@@ -104,7 +107,7 @@ class CheckpointManager:
             'val_loss': val_loss,
             'learning_rate': learning_rate,
             'timestamp': datetime.datetime.now().isoformat(),
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': base_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'rng_state': {
                 'python': torch.get_rng_state(),
@@ -165,7 +168,15 @@ class CheckpointManager:
 
         # Load model state if model provided
         if model is not None:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            state_dict = checkpoint['model_state_dict']
+
+            # If saved from a compiled model, keys may be prefixed with "_orig_mod."
+            if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+                state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+
+            # If target model is compiled, load into underlying _orig_mod
+            target_model = getattr(model, "_orig_mod", model)
+            target_model.load_state_dict(state_dict)
 
         # Load optimizer state if optimizer provided
         if optimizer is not None:
