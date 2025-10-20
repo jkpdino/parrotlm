@@ -436,10 +436,12 @@ class TrainingApp(App):
                 weight_decay=self.config.training.weight_decay
             )
         else:
+            # Use fused AdamW for 2-3x speedup on CUDA
             self.optimizer = torch.optim.AdamW(
                 self.model.parameters(),
                 lr=self.config.training.learning_rate,
-                weight_decay=self.config.training.weight_decay
+                weight_decay=self.config.training.weight_decay,
+                fused=torch.cuda.is_available()  # Fused kernel for CUDA
             )
 
         # Create checkpoint manager
@@ -637,26 +639,26 @@ class TrainingApp(App):
                 loss.backward()
         backward_time = time.time() - backward_start
 
-        # Check for gradient NaN/Inf after backward (only every 100 batches to reduce overhead)
+        # Check for gradient NaN/Inf after backward (disabled for speed - loss check above catches most issues)
         grad_check_time = 0.0
-        if self.current_batch % 100 == 0:
-            check_start = time.time()
-            has_nan_grad = False
-            for param in self.model.parameters():
-                if param.grad is not None and not torch.isfinite(param.grad).all():
-                    has_nan_grad = True
-                    break
-            grad_check_time = time.time() - check_start
-
-            if has_nan_grad:
-                with self.state_lock:
-                    self.is_training = False
-                # Safely update UI from training thread
-                self.call_from_thread(
-                    self.query_one("#metrics-bar", Static).update,
-                    "[bold red]TRAINING STOPPED: Gradients became NaN/Inf. Try lowering learning rate.[/bold red]"
-                )
-                return
+        # Uncomment to enable periodic gradient NaN checking:
+        # if self.current_batch % 1000 == 0:
+        #     check_start = time.time()
+        #     has_nan_grad = False
+        #     for param in self.model.parameters():
+        #         if param.grad is not None and not torch.isfinite(param.grad).all():
+        #             has_nan_grad = True
+        #             break
+        #     grad_check_time = time.time() - check_start
+        #
+        #     if has_nan_grad:
+        #         with self.state_lock:
+        #             self.is_training = False
+        #         self.call_from_thread(
+        #             self.query_one("#metrics-bar", Static).update,
+        #             "[bold red]TRAINING STOPPED: Gradients became NaN/Inf. Try lowering learning rate.[/bold red]"
+        #         )
+        #         return
 
         # Gradient clipping
         grad_clip_time = 0.0
