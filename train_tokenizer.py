@@ -15,7 +15,7 @@ Usage:
     python train_tokenizer.py --config configs/my_tokenizer.yml
 
 Example:
-    python train_tokenizer.py --dataset tinystories_100k --name tiny_bpe_8k --vocab-size 16384
+    python train_tokenizer.py --dataset tinystories_100k --name tiny_bpe_8k --vocab-size 32768
 """
 
 import argparse

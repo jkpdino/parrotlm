@@ -13,7 +13,7 @@ from ..exceptions import ConfigError, ValidationError
 class ModelConfig:
     """Configuration for model architecture."""
 
-    vocab_size: int = 16384
+    vocab_size: int = 32768
     dim: int = 96
     depth: int = 16
     n_heads: int = 6
@@ -227,7 +227,7 @@ def load_training_config(config_path: str | Path) -> TrainingRunConfig:
     # Parse model config
     model_data = data.get('model', {})
     model_config = ModelConfig(
-        vocab_size=model_data.get('vocab_size', 16384),
+        vocab_size=model_data.get('vocab_size', 32768),
         dim=model_data.get('dim', 96),
         depth=model_data.get('depth', 16),
         n_heads=model_data.get('n_heads', 6),

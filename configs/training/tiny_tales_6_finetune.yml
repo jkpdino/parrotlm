@@ -6,31 +6,31 @@ random_seed: 42
 
 # Model architecture - MUST match the checkpoint
 model:
-  vocab_size: 16384 # Match tinystories tokenizer
+  vocab_size: 32768 # Match tinystories tokenizer
   dim: 256 # Model dimension
   depth: 24 # Number of transformer layers
   n_heads: 16 # Number of query heads
   n_kv_heads: 4 # Number of key/value heads (GQA: 3:1 ratio)
-  context_length: 2048 # Maximum sequence length
+  context_length: 1024 # Maximum sequence length
   dropout: 0.0 # Dropout (modern LLMs use 0.0)
   ffn_hidden_mult: 4 # FFN hidden dimension multiplier
   pad_token_id: 0 # Padding token ID
   rope_scaling_factor: 4.0 # RoPE cache scaling factor
-  use_gradient_checkpointing: false # Enable for larger models to save memory
+  use_gradient_checkpointing: true # Enable for larger models to save memory
 
 # Data configuration - Point to tiny_tales_6 dataset
 data:
   dataset_path: "datasets/tiny_tales_6/pretokenized/tinystories_tokenizer"
   tokenizer_path: "tokenizers/tinystories_tokenizer/tokenizer.json"
-  batch_size: 8 # Batch size (adjust based on GPU memory)
+  batch_size: 16 # Batch size (adjust based on GPU memory)
   shuffle: true # Shuffle training data for fine-tuning
   num_workers: 0 # DataLoader workers (0 for single-threaded)
 
 # Training hyperparameters - Fine-tuning settings
 training:
-  learning_rate: 0.0002 # Lower LR for fine-tuning (10x lower than pretraining)
+  learning_rate: 0.0001 # Lower LR for fine-tuning (10x lower than pretraining)
   max_batches: null # Maximum number of batches
-  max_tokens: 866489984 # 5M additional tokens for fine-tuning
+  max_tokens: 872989984 # 5M additional tokens for fine-tuning
   optimizer: "adamw" # "muon" or "adamw"
   warmup_batches: 100 # Shorter warmup for fine-tuning
   weight_decay: 0.1 # Weight decay

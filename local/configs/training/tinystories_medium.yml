@@ -6,7 +6,7 @@ random_seed: 42
 
 # Model architecture
 model:
-  vocab_size: 16384 # Match your tokenizer vocab size
+  vocab_size: 32768 # Match your tokenizer vocab size
   dim: 256 # Model dimension
   depth: 24 # Number of transformer layers
   n_heads: 16 # Number of query heads

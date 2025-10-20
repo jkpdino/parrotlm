@@ -97,6 +97,28 @@ def load_model_from_checkpoint(
     return model
 
 
+def _decode_token(tokenizer, token_id: int) -> str:
+    """
+    Decode a single token and replace BPE placeholder characters.
+
+    Args:
+        tokenizer: Tokenizer for decoding
+        token_id: Token ID to decode
+
+    Returns:
+        Decoded string with BPE placeholders replaced
+    """
+    text = tokenizer.decode([token_id])
+    # Replace BPE placeholder characters with their actual representations
+    text = text.replace('Ġ', ' ')   # U+0120: space/word boundary
+    text = text.replace('Ċ', '\n')  # U+010A: newline
+    text = text.replace('Ĉ', '\n')  # U+0108: alternative newline marker
+    text = text.replace('ĉ', '\n')  # U+0109: lowercase alternative
+    text = text.replace('Č', '\r')  # U+010C: carriage return (rare)
+    text = text.replace('č', '\r')  # U+010D: lowercase alternative
+    return text
+
+
 def generate_sample(
     model: GPT,
     tokenizer,
@@ -106,7 +128,9 @@ def generate_sample(
     top_k: Optional[int] = None,
     top_p: Optional[float] = None,
     repetition_penalty: float = 1.0,
-    device: Optional[torch.device] = None
+    device: Optional[torch.device] = None,
+    eos_token_id: Optional[int] = None,
+    stream: bool = False
 ) -> tuple[str, int, float]:
     """
     Generate a single sample from the model.
@@ -121,6 +145,8 @@ def generate_sample(
         top_p: If set, use nucleus sampling
         repetition_penalty: Penalty for repeating tokens
         device: Device to run generation on
+        eos_token_id: If set, stop generation when this token is encountered
+        stream: If True, print tokens as they are generated
 
     Returns:
         Tuple of (generated_text, token_count, generation_time_seconds)
@@ -132,44 +158,137 @@ def generate_sample(
     encoding = tokenizer.encode(prompt)
     input_ids = torch.tensor([encoding.ids], dtype=torch.long, device=device)
 
-    # Generate
+    # Generate with streaming
     start_time = time.time()
     model.eval()
-    with torch.no_grad():
+
+    if stream:
+        # Streaming generation - decode and print tokens one by one
         try:
-            output_ids = model.generate(
-                input_ids,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty
-            )
+            tokens = input_ids
+            generated_tokens = []
+            layer_caches = [None] * model.depth
+
+            for step_idx in range(max_tokens):
+                # Determine input tokens for this step
+                if step_idx == 0:
+                    # First iteration: process all input tokens
+                    tokens_input = tokens if tokens.size(1) <= model.context_length else tokens[:, -model.context_length:]
+                else:
+                    # Subsequent iterations: only process the last generated token
+                    tokens_input = tokens[:, -1:]
+
+                # Forward pass with KV cache
+                with torch.no_grad():
+                    # Embed tokens
+                    x = model.token_embedding(tokens_input)
+                    x = model.emb_dropout(x)
+
+                    # Pass through blocks with cache
+                    new_caches = []
+                    for block, cache in zip(model.blocks, layer_caches):
+                        x, new_cache, aux_losses = block(x, attention_mask=None, kv_cache=cache, use_cache=True)
+                        new_caches.append(new_cache)
+
+                    layer_caches = new_caches
+
+                    # Final norm and projection
+                    x = model.norm_f(x)
+                    logits = torch.nn.functional.linear(x, model.token_embedding.weight)
+
+                # Get logits for last position
+                logits = logits[:, -1, :].clone()
+
+                # Apply repetition penalty
+                if repetition_penalty != 1.0:
+                    for token_id in set(tokens[0].tolist()):
+                        if logits[0, token_id] < 0:
+                            logits[0, token_id] *= repetition_penalty
+                        else:
+                            logits[0, token_id] /= repetition_penalty
+
+                # Apply temperature
+                logits = logits / temperature
+
+                # Top-k filtering
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = float('-inf')
+
+                # Top-p filtering
+                if top_p is not None:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                    cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[:, 0] = False
+                    indices_to_remove = sorted_indices[0, sorted_indices_to_remove[0]]
+                    logits[0, indices_to_remove] = float('-inf')
+
+                # Sample
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                next_token_id = next_token[0, 0].item()
+
+                # Check for EOS
+                if eos_token_id is not None and next_token_id == eos_token_id:
+                    break
+
+                # Decode and print token immediately
+                token_text = _decode_token(tokenizer, next_token_id)
+                print(token_text, end='', flush=True)
+
+                generated_tokens.append(next_token_id)
+                tokens = torch.cat([tokens, next_token], dim=1)
+
             generation_time = time.time() - start_time
 
-            # Decode tokens without adding spaces between them
-            output_tokens = output_ids[0].cpu().tolist()
-            token_count = len(output_tokens)
-
-            # Decode each token individually and concatenate without spaces
-            decoded_tokens = [tokenizer.decode([token_id]) for token_id in output_tokens]
-            generated_text = ''.join(decoded_tokens)
-
-            # Replace BPE placeholder characters with their actual representations
-            generated_text = generated_text.replace('Ġ', ' ')   # U+0120: space/word boundary
-            generated_text = generated_text.replace('Ċ', '\n')  # U+010A: newline
-            generated_text = generated_text.replace('Ĉ', '\n')  # U+0108: alternative newline marker
-            generated_text = generated_text.replace('ĉ', '\n')  # U+0109: lowercase alternative
-            generated_text = generated_text.replace('Č', '\r')  # U+010C: carriage return (rare)
-            generated_text = generated_text.replace('č', '\r')  # U+010D: lowercase alternative
+            # Reconstruct full text
+            generated_text = ''.join([_decode_token(tokenizer, tid) for tid in generated_tokens])
+            token_count = len(generated_tokens)
 
             return generated_text, token_count, generation_time
 
         except (RuntimeError, ValueError) as e:
-            # Handle NaN/Inf errors during generation
             generation_time = time.time() - start_time
             error_msg = f"[Generation failed: {str(e)}]"
+            print(error_msg)
             return error_msg, 0, generation_time
+
+    else:
+        # Non-streaming generation (original behavior)
+        with torch.no_grad():
+            try:
+                output_ids = model.generate(
+                    input_ids,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    eos_token_id=eos_token_id
+                )
+                generation_time = time.time() - start_time
+
+                # Decode tokens without adding spaces between them
+                output_tokens = output_ids[0].cpu().tolist()
+
+                # Truncate at EOS token if present
+                if eos_token_id is not None and eos_token_id in output_tokens:
+                    eos_position = output_tokens.index(eos_token_id)
+                    output_tokens = output_tokens[:eos_position]  # Exclude the EOS token itself
+
+                token_count = len(output_tokens)
+
+                # Decode each token individually and concatenate without spaces
+                generated_text = ''.join([_decode_token(tokenizer, tid) for tid in output_tokens])
+
+                return generated_text, token_count, generation_time
+
+            except (RuntimeError, ValueError) as e:
+                # Handle NaN/Inf errors during generation
+                generation_time = time.time() - start_time
+                error_msg = f"[Generation failed: {str(e)}]"
+                return error_msg, 0, generation_time
 
 
 def run_inference_batch(
@@ -183,7 +302,9 @@ def run_inference_batch(
     top_p: Optional[float] = None,
     repetition_penalty: float = 1.0,
     device: Optional[torch.device] = None,
-    verbose: bool = True
+    verbose: bool = True,
+    eos_token_id: Optional[int] = None,
+    stream: bool = False
 ) -> List[dict]:
     """
     Run inference on multiple prompts.
@@ -200,6 +321,8 @@ def run_inference_batch(
         repetition_penalty: Penalty for repeating tokens
         device: Device to run generation on
         verbose: Whether to print progress
+        eos_token_id: If set, stop generation when this token is encountered
+        stream: If True, print tokens as they are generated
 
     Returns:
         List of dictionaries with inference results
@@ -220,10 +343,13 @@ def run_inference_batch(
         for sample_idx in range(num_samples_per_prompt):
             inference_num += 1
 
+            if verbose and stream:
+                print(f"\nSample {sample_idx + 1}/{num_samples_per_prompt}:")
+
             # Generate
             generated_text, token_count, generation_time = generate_sample(
                 model, tokenizer, prompt, max_tokens,
-                temperature, top_k, top_p, repetition_penalty, device
+                temperature, top_k, top_p, repetition_penalty, device, eos_token_id, stream
             )
 
             # Calculate tokens per second
@@ -249,9 +375,14 @@ def run_inference_batch(
             results.append(result)
 
             if verbose:
-                print(f"\nSample {sample_idx + 1}/{num_samples_per_prompt}:")
-                print(f"{generated_text}")
-                print(f"[{token_count} tokens in {generation_time:.2f}s = {tokens_per_sec:.1f} tok/s]")
+                if stream:
+                    # Token-by-token output already printed, just add stats
+                    print(f"\n[{token_count} tokens in {generation_time:.2f}s = {tokens_per_sec:.1f} tok/s]")
+                else:
+                    # Print all at once
+                    print(f"\nSample {sample_idx + 1}/{num_samples_per_prompt}:")
+                    print(f"{generated_text}")
+                    print(f"[{token_count} tokens in {generation_time:.2f}s = {tokens_per_sec:.1f} tok/s]")
 
     return results
 
@@ -329,6 +460,10 @@ Examples:
   python infer.py --checkpoint path/to/checkpoint.pt \\
                   --prompt "Hello world" --num-samples 20 \\
                   --temperature 0.8 --top-k 50 --top-p 0.9 --max-tokens 100
+
+  # Streaming output (see tokens as they're generated)
+  python infer.py --checkpoint path/to/checkpoint.pt \\
+                  --prompt "Once upon a time" --num-samples 1 --stream
         """
     )
 
@@ -420,6 +555,11 @@ Examples:
         action="store_true",
         help="Suppress progress output"
     )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream tokens as they are generated (real-time output)"
+    )
 
     args = parser.parse_args()
 
@@ -460,6 +600,19 @@ Examples:
     print(f"\nLoading tokenizer from: {config.data.tokenizer_path}")
     tokenizer = load_tokenizer(config.data.tokenizer_path)
 
+    # Try to get EOS token ID
+    eos_token_id = None
+    try:
+        # Try to encode the <|eos|> token
+        eos_encoding = tokenizer.encode("<|eos|>")
+        if len(eos_encoding.ids) == 1:
+            eos_token_id = eos_encoding.ids[0]
+            print(f"Found EOS token '<|eos|>' with ID: {eos_token_id}")
+        else:
+            print("Warning: '<|eos|>' encodes to multiple tokens, not using EOS stopping")
+    except Exception as e:
+        print(f"Warning: Could not encode '<|eos|>' token: {e}")
+
     # Prepare prompts
     if args.prompt:
         prompts = [args.prompt]
@@ -482,7 +635,9 @@ Examples:
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
         device=device,
-        verbose=not args.quiet
+        verbose=not args.quiet,
+        eos_token_id=eos_token_id,
+        stream=args.stream
     )
 
     # Save results

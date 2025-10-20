@@ -26,6 +26,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from torch.profiler import profile, record_function, ProfilerActivity, schedule, tensorboard_trace_handler
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
@@ -55,8 +56,8 @@ class ConfigReviewScreen(Static):
         # Determine device
         if torch.cuda.is_available():
             device_info = f"cuda ({torch.cuda.get_device_name(0)})"
-        # elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        #     device_info = "mps (Apple Silicon)"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device_info = "mps (Apple Silicon)"
         else:
             device_info = "cpu"
 
@@ -292,13 +293,18 @@ class TrainingApp(App):
         self.profiler = None
 
         # Components (will be initialized in on_mount)
-        # Priority: CUDA > CPU (MPS disabled for testing)
+        # Priority: CUDA > MPS > CPU
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
-        # elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        #     self.device = torch.device("mps")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
         else:
             self.device = torch.device("cpu")
+
+        # Mixed precision training (CUDA only for now)
+        self.use_amp = torch.cuda.is_available()
+        self.scaler = GradScaler() if self.use_amp else None
+
         self.model: Optional[GPT] = None
         self.optimizer = None
         self.checkpoint_manager: Optional[CheckpointManager] = None
@@ -342,8 +348,9 @@ class TrainingApp(App):
         # Update UI
         self.query_one("#metrics-bar", Static).update("Ready to train! Press SPACE to pause/resume")
 
-        # Start training loop
-        self.set_interval(0.1, self._training_step)
+        # Start async training loop (runs at full GPU speed with periodic yields)
+        self.run_worker(self._training_loop())
+        # Update UI every second
         self.set_interval(1.0, self._update_ui)
 
     async def _initialize_training(self) -> None:
@@ -369,6 +376,26 @@ class TrainingApp(App):
             router_aux_loss_coef=self.config.model.router_aux_loss_coef,
             router_z_loss_coef=self.config.model.router_z_loss_coef
         ).to(self.device)
+
+        # Compile model for 2-3x speedup
+        if torch.cuda.is_available():
+            print("Compiling model with torch.compile() - this takes ~1 minute...")
+            self.model = torch.compile(self.model)
+        elif self.device.type == "mps":
+            # Try compiling on MPS with workaround for macOS multiprocessing issue
+            print("Compiling model for MPS (using eager backend to avoid subprocess issues)...")
+            try:
+                import multiprocessing
+                try:
+                    multiprocessing.set_start_method('spawn', force=True)
+                except RuntimeError:
+                    pass  # Already set
+                # Use eager backend which avoids the inductor subprocess issue
+                self.model = torch.compile(self.model, backend="aot_eager")
+            except Exception as e:
+                print(f"Warning: torch.compile failed on MPS ({e}), continuing without compilation")
+        else:
+            print(f"Skipping torch.compile on CPU (not beneficial)")
 
         # Create optimizer
         if self.config.training.optimizer == "muon":
@@ -497,8 +524,8 @@ class TrainingApp(App):
         # Start training
         self.is_training = True
 
-    def _training_step(self) -> None:
-        """Execute one training step."""
+    def _do_single_training_step(self) -> None:
+        """Execute one training step (synchronous)."""
         if not self.is_training or self.is_paused or self.should_quit:
             return
 
@@ -524,30 +551,31 @@ class TrainingApp(App):
                 self.train_loader.reset()
                 tokens, masks, labels = next(self.train_loader)
 
-        # Forward pass
+        # Forward pass with mixed precision
+        self.model.train()
         with record_function("forward"):
-            self.model.train()
-            result = self.model(tokens, masks)
+            # Use autocast for CUDA mixed precision training
+            with autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
+                result = self.model(tokens, masks)
 
-        # Handle MoE models (return tuple) vs standard models (return tensor)
-        with record_function("loss_computation"):
-            if isinstance(result, tuple):
-                logits, aux_losses = result
-            else:
-                logits = result
-                aux_losses = None
+                # Handle MoE models (return tuple) vs standard models (return tensor)
+                if isinstance(result, tuple):
+                    logits, aux_losses = result
+                else:
+                    logits = result
+                    aux_losses = None
 
-            # Compute main loss
-            loss = F.cross_entropy(
-                logits.view(-1, self.config.model.vocab_size),
-                labels.view(-1),
-                ignore_index=0
-            )
+                # Compute main loss
+                loss = F.cross_entropy(
+                    logits.view(-1, self.config.model.vocab_size),
+                    labels.view(-1),
+                    ignore_index=0
+                )
 
-            # Add auxiliary losses if using MoE
-            if aux_losses is not None:
-                for aux_loss_name, aux_loss_value in aux_losses.items():
-                    loss = loss + aux_loss_value
+                # Add auxiliary losses if using MoE
+                if aux_losses is not None:
+                    for aux_loss_name, aux_loss_value in aux_losses.items():
+                        loss = loss + aux_loss_value
 
         # Check for NaN/Inf
         if not torch.isfinite(loss):
@@ -557,10 +585,13 @@ class TrainingApp(App):
             )
             return
 
-        # Backward pass
+        # Backward pass with gradient scaling for mixed precision
         with record_function("backward"):
             self.optimizer.zero_grad()
-            loss.backward()
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
         # Check for gradient NaN/Inf after backward
         has_nan_grad = False
@@ -579,14 +610,21 @@ class TrainingApp(App):
         # Gradient clipping
         with record_function("gradient_clipping"):
             if self.config.training.grad_clip:
+                if self.use_amp:
+                    # Unscale gradients before clipping
+                    self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.config.training.grad_clip
                 )
 
-        # Optimizer step
+        # Optimizer step with gradient scaling
         with record_function("optimizer_step"):
-            self.optimizer.step()
+            if self.use_amp:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
 
         # Update progress
         self.current_batch += 1
@@ -596,13 +634,14 @@ class TrainingApp(App):
         self.current_lr = self._get_lr()
         self._set_lr(self.current_lr)
 
-        # Log metrics
-        self.metrics_tracker.log(
-            batch=self.current_batch,
-            tokens_seen=self.tokens_seen,
-            train_loss=loss.item(),
-            learning_rate=self.current_lr
-        )
+        # Log metrics (only every 10 batches to reduce overhead)
+        if self.current_batch % 10 == 0:
+            self.metrics_tracker.log(
+                batch=self.current_batch,
+                tokens_seen=self.tokens_seen,
+                train_loss=loss.item(),
+                learning_rate=self.current_lr
+            )
 
         # Periodic tasks
         if self.current_batch % self.config.checkpointing.save_every_n_batches == 0:
@@ -618,6 +657,29 @@ class TrainingApp(App):
         # Profiler step
         if self.profiler is not None:
             self.profiler.step()
+
+    async def _training_loop(self) -> None:
+        """Main training loop that yields periodically to keep UI responsive."""
+        import asyncio
+
+        # Batches to process before yielding to event loop
+        # Adjust based on your batch speed - higher for faster batches
+        batches_per_yield = 50
+
+        while self.is_training and not self.should_quit:
+            # If paused, yield and wait
+            if self.is_paused:
+                await asyncio.sleep(0.1)
+                continue
+
+            # Run multiple batches in a tight loop
+            for _ in range(batches_per_yield):
+                if not self.is_training or self.is_paused or self.should_quit:
+                    break
+                self._do_single_training_step()
+
+            # Yield to UI event loop (minimal overhead, ~1-10 microseconds)
+            await asyncio.sleep(0)
 
     def _save_checkpoint(self, create_numbered: bool = False) -> None:
         """Save a checkpoint."""
@@ -807,9 +869,9 @@ class TrainingApp(App):
             if torch.cuda.is_available():
                 device_memory = torch.cuda.memory_allocated(self.device) / 1024**3  # GB
                 return f"{device_memory:.2f}/{rss_gb:.2f} GB"
-            # elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            #     device_memory = torch.mps.current_allocated_memory() / 1024**3  # GB
-            #     return f"{device_memory:.2f}/{rss_gb:.2f} GB (USS:{uss_gb:.2f})"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device_memory = torch.mps.current_allocated_memory() / 1024**3  # GB
+                return f"{device_memory:.2f}/{rss_gb:.2f} GB"
             else:
                 return f"{rss_gb:.2f} GB"
         except Exception as e:
@@ -988,8 +1050,8 @@ def main():
     # Determine device
     if torch.cuda.is_available():
         device_info = f"CUDA ({torch.cuda.get_device_name(0)})"
-    # elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    #     device_info = "MPS (Apple Silicon)"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device_info = "MPS (Apple Silicon)"
     else:
         device_info = "CPU"
 

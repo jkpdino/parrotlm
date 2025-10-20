@@ -10,9 +10,43 @@ Modern features:
 """
 
 import math
+from dataclasses import dataclass
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+@dataclass
+class KVCache:
+    """
+    Stores cached keys and values for efficient autoregressive generation.
+
+    During inference, we cache K and V tensors from previous tokens to avoid
+    recomputing them. This reduces generation from O(n²) to O(n) complexity.
+
+    Args:
+        k: Cached keys (batch, n_kv_heads, seq_len, head_dim)
+        v: Cached values (batch, n_kv_heads, seq_len, head_dim)
+    """
+    k: torch.Tensor
+    v: torch.Tensor
+
+    def update(self, new_k: torch.Tensor, new_v: torch.Tensor) -> 'KVCache':
+        """
+        Concatenate new keys/values with cached ones.
+
+        Args:
+            new_k: New keys to append (batch, n_kv_heads, new_seq_len, head_dim)
+            new_v: New values to append (batch, n_kv_heads, new_seq_len, head_dim)
+
+        Returns:
+            Updated KVCache with concatenated tensors
+        """
+        return KVCache(
+            k=torch.cat([self.k, new_k], dim=2),
+            v=torch.cat([self.v, new_v], dim=2)
+        )
 
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -166,38 +200,74 @@ class MultiHeadSelfAttention(nn.Module):
 
         self.resid_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        kv_cache: Optional[KVCache] = None,
+        use_cache: bool = False
+    ) -> tuple[torch.Tensor, Optional[KVCache]]:
         """
         Args:
             x: (batch, seq_len, dim)
             attention_mask: (batch, 1, seq_len, seq_len) pre-combined additive mask (0 for attend, -inf for mask)
                            Already includes both causal + document masking combined
                            If None, automatic causal masking is used
+            kv_cache: Optional cached keys/values from previous tokens (inference only)
+            use_cache: If True, return updated cache (inference only)
 
         Returns:
-            (batch, seq_len, dim)
+            (output, new_cache) where:
+            - output: (batch, seq_len, dim)
+            - new_cache: Updated KVCache if use_cache=True, else None
         """
         batch_size, seq_len, dim = x.shape
 
-        # Compute Q, K, V separately (for GQA)
+        # Compute Q for current tokens (always needed)
         q = self.q_proj(x)  # (batch, seq_len, n_heads * head_dim)
-        k = self.k_proj(x)  # (batch, seq_len, n_kv_heads * head_dim)
-        v = self.v_proj(x)  # (batch, seq_len, n_kv_heads * head_dim)
-
-        # Reshape to separate heads
         q = q.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         # (batch, n_heads, seq_len, head_dim)
 
-        k = k.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        # (batch, n_kv_heads, seq_len, head_dim)
+        if kv_cache is not None:
+            # INFERENCE PATH: Use cached K/V, only compute for new tokens
+            k_new = self.k_proj(x)  # (batch, seq_len, n_kv_heads * head_dim)
+            v_new = self.v_proj(x)  # (batch, seq_len, n_kv_heads * head_dim)
 
-        v = v.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        # (batch, n_kv_heads, seq_len, head_dim)
+            k_new = k_new.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v_new = v_new.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            # (batch, n_kv_heads, seq_len, head_dim)
 
-        # Apply RoPE to Q and K (not V!)
-        cos, sin = self.rope(seq_len)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+            # Apply RoPE with position offset
+            cache_len = kv_cache.k.size(2)
+            cos, sin = self.rope(cache_len + seq_len)
+            cos_offset = cos[:, :, cache_len:cache_len + seq_len, :]
+            sin_offset = sin[:, :, cache_len:cache_len + seq_len, :]
+
+            q = apply_rotary_emb(q, cos_offset, sin_offset)
+            k_new = apply_rotary_emb(k_new, cos_offset, sin_offset)
+
+            # Concatenate with cache
+            k = torch.cat([kv_cache.k, k_new], dim=2)
+            v = torch.cat([kv_cache.v, v_new], dim=2)
+
+            # Create updated cache
+            new_cache = KVCache(k=k, v=v) if use_cache else None
+        else:
+            # TRAINING PATH: Normal computation (no cache)
+            k = self.k_proj(x)  # (batch, seq_len, n_kv_heads * head_dim)
+            v = self.v_proj(x)  # (batch, seq_len, n_kv_heads * head_dim)
+
+            k = k.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v = v.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            # (batch, n_kv_heads, seq_len, head_dim)
+
+            # Apply RoPE from position 0
+            cos, sin = self.rope(seq_len)
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
+
+            # Create initial cache if requested
+            new_cache = KVCache(k=k, v=v) if use_cache else None
 
         # Repeat K and V to match number of Q heads (GQA)
         # If n_heads=6 and n_kv_heads=2, we repeat each KV head 3 times
@@ -217,12 +287,15 @@ class MultiHeadSelfAttention(nn.Module):
                 is_causal=False  # We already have the combined mask
             )
         else:
-            # No mask provided, use automatic causal masking (faster, enables Flash Attention)
+            # When using cache: Q and K have different seq lengths, and new token
+            # should attend to ALL cached tokens (no masking), so use is_causal=False
+            # When not using cache: Q and K same length, use is_causal=True for efficiency
+            use_causal = (kv_cache is None)
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=None,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True
+                is_causal=use_causal
             )
         # (batch, n_heads, seq_len, head_dim)
 
@@ -234,7 +307,7 @@ class MultiHeadSelfAttention(nn.Module):
         out = self.out_proj(out)
         out = self.resid_dropout(out)
 
-        return out
+        return out, new_cache
 
 
 class FeedForward(nn.Module):
@@ -453,28 +526,39 @@ class TransformerBlock(nn.Module):
             self.ffn = FeedForward(dim, ffn_hidden_mult, dropout)
 
     def forward(
-        self, x: torch.Tensor, attention_mask: torch.Tensor = None
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | torch.Tensor:
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        kv_cache: Optional[KVCache] = None,
+        use_cache: bool = False
+    ) -> tuple[torch.Tensor, Optional[KVCache], Optional[dict[str, torch.Tensor]]]:
         """
         Args:
             x: (batch, seq_len, dim)
-            attention_mask: (batch, seq_len, seq_len) additive mask
+            attention_mask: (batch, 1, seq_len, seq_len) pre-combined additive mask (0/-inf format)
+                           Already includes both causal + document masking combined (if from GPT.forward)
+                           If None, relies on attention layer's causal masking
+            kv_cache: Optional cached keys/values from previous tokens (inference only)
+            use_cache: If True, return updated cache (inference only)
 
         Returns:
-            If MoE: (output, aux_losses) where aux_losses is dict
-            Otherwise: output tensor
+            (output, new_cache, aux_losses) where:
+            - output: (batch, seq_len, dim)
+            - new_cache: Updated KVCache if use_cache=True, else None
+            - aux_losses: Dict with MoE losses if using MoE, else None
         """
         # Pre-norm attention with residual
-        x = x + self.attn(self.norm1(x), attention_mask)
+        attn_out, new_cache = self.attn(self.norm1(x), attention_mask, kv_cache, use_cache)
+        x = x + attn_out
 
         # Pre-norm FFN with residual
         if self.use_moe:
             ffn_output, aux_losses = self.ffn(self.norm2(x))
             x = x + ffn_output
-            return x, aux_losses
+            return x, new_cache, aux_losses
         else:
             x = x + self.ffn(self.norm2(x))
-            return x
+            return x, new_cache, None
 
 
 class GPT(nn.Module):
@@ -492,7 +576,7 @@ class GPT(nn.Module):
     - Pre-norm architecture
 
     Configuration for ~1.8M parameters (excluding embeddings):
-        GPT(vocab_size=16384, dim=96, depth=16, n_heads=6, n_kv_heads=2)
+        GPT(vocab_size=32768, dim=96, depth=16, n_heads=6, n_kv_heads=2)
 
     Args:
         vocab_size: Size of the vocabulary
@@ -508,19 +592,19 @@ class GPT(nn.Module):
         use_gradient_checkpointing: If True, use gradient checkpointing to reduce memory usage during training
 
     Example:
-        >>> model = GPT(vocab_size=16384, dim=96, depth=16, n_heads=6)
+        >>> model = GPT(vocab_size=32768, dim=96, depth=16, n_heads=6)
         >>> print(f"Transformer params: {model.count_parameters()['transformer']:,}")
         >>> print(f"Total params: {model.count_parameters()['total']:,}")
         >>>
         >>> # Forward pass
-        >>> tokens = torch.randint(0, 16384, (4, 512))  # (batch, seq_len)
+        >>> tokens = torch.randint(0, 32768, (4, 512))  # (batch, seq_len)
         >>> masks = torch.zeros(4, 512, 512)  # (batch, seq_len, seq_len)
-        >>> logits = model(tokens, masks)  # (4, 512, 16384)
+        >>> logits = model(tokens, masks)  # (4, 512, 32768)
     """
 
     def __init__(
         self,
-        vocab_size: int = 16384  ,
+        vocab_size: int = 32768  ,
         dim: int = 96,
         depth: int = 16,
         n_heads: int = 6,
@@ -710,27 +794,27 @@ class GPT(nn.Module):
 
         # Apply transformer blocks with optional gradient checkpointing
         # Pass the SAME combined mask to all blocks (no recreating masks per layer)
+        # Note: During training, we never pass cache (kv_cache=None, use_cache=False by default)
         for block in self.blocks:
             if self.use_gradient_checkpointing and self.training:
                 # Use gradient checkpointing to save memory during training
                 # Note: Gradient checkpointing with MoE is complex, using without for now
                 if block.use_moe:
-                    x, aux_losses = block(x, combined_mask)
+                    x, _, aux_losses = block(x, combined_mask)
                     if total_aux_loss is not None:
                         total_aux_loss['load_balance_loss'] += aux_losses['load_balance_loss']
                         total_aux_loss['router_z_loss'] += aux_losses['router_z_loss']
                 else:
-                    x = torch.utils.checkpoint.checkpoint(block, x, combined_mask, use_reentrant=False)
+                    x, _, _ = torch.utils.checkpoint.checkpoint(block, x, combined_mask, use_reentrant=False)
             else:
-                result = block(x, combined_mask)
-                # Handle both MoE blocks (returns tuple) and standard blocks (returns tensor)
-                if isinstance(result, tuple):
-                    x, aux_losses = result
-                    if total_aux_loss is not None:
-                        total_aux_loss['load_balance_loss'] += aux_losses['load_balance_loss']
-                        total_aux_loss['router_z_loss'] += aux_losses['router_z_loss']
-                else:
-                    x = result
+                # Standard path (no gradient checkpointing)
+                # TransformerBlock now always returns (x, cache, aux_losses)
+                x, _, aux_losses = block(x, combined_mask)
+
+                # Accumulate MoE auxiliary losses if present
+                if aux_losses is not None and total_aux_loss is not None:
+                    total_aux_loss['load_balance_loss'] += aux_losses['load_balance_loss']
+                    total_aux_loss['router_z_loss'] += aux_losses['router_z_loss']
 
         # Final RMS norm
         x = self.norm_f(x)
@@ -790,7 +874,7 @@ class GPT(nn.Module):
         eos_token_id: int = None
     ) -> torch.Tensor:
         """
-        Generate tokens autoregressively with advanced sampling options.
+        Generate tokens autoregressively with KV cache for efficiency.
 
         Args:
             tokens: (batch, seq_len) initial token IDs
@@ -807,28 +891,47 @@ class GPT(nn.Module):
         self.eval()
         batch_size = tokens.size(0)
 
+        # Initialize KV caches for all layers (None = no cache yet)
+        layer_caches = [None] * self.depth
+
         # Track if each sequence has generated EOS
         finished = torch.zeros(batch_size, dtype=torch.bool, device=tokens.device)
 
-        for _ in range(max_new_tokens):
+        for step_idx in range(max_new_tokens):
             # Stop if all sequences have finished
             if eos_token_id is not None and finished.all():
                 break
 
-            # Crop to context length
-            tokens_crop = tokens if tokens.size(1) <= self.context_length else tokens[:, -self.context_length:]
+            # Determine input tokens for this step
+            if step_idx == 0:
+                # First iteration: process all input tokens
+                # Crop to context length if needed
+                tokens_input = tokens if tokens.size(1) <= self.context_length else tokens[:, -self.context_length:]
+            else:
+                # Subsequent iterations: only process the last generated token
+                tokens_input = tokens[:, -1:]
 
-            # Forward pass
+            # Forward pass with KV cache
             with torch.no_grad():
-                result = self(tokens_crop)  # (batch, seq_len, vocab_size) or tuple with aux_losses
+                # Embed tokens
+                x = self.token_embedding(tokens_input)
+                x = self.emb_dropout(x)
 
-                # Handle MoE models (return tuple) vs standard models (return tensor)
-                if isinstance(result, tuple):
-                    logits, _ = result  # Ignore aux losses during generation
-                else:
-                    logits = result
+                # Pass through blocks with cache
+                new_caches = []
+                for block, cache in zip(self.blocks, layer_caches):
+                    # Pass cache and request cache update
+                    x, new_cache, aux_losses = block(x, attention_mask=None, kv_cache=cache, use_cache=True)
+                    new_caches.append(new_cache)
 
-            # Get logits for last position
+                # Update cache list for next iteration
+                layer_caches = new_caches
+
+                # Final norm and projection
+                x = self.norm_f(x)
+                logits = F.linear(x, self.token_embedding.weight)
+
+            # Get logits for last position (always position -1 in the output)
             logits = logits[:, -1, :].clone()  # (batch, vocab_size)
 
             # Apply repetition penalty
@@ -920,7 +1023,7 @@ def create_default_gpt(use_mqa=False):
     n_kv_heads = 1 if use_mqa else 2
 
     return GPT(
-        vocab_size=16384,
+        vocab_size=32768,
         dim=96,
         depth=16,
         n_heads=6,
