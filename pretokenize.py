@@ -25,6 +25,7 @@ from src.tokenizer import (
     save_document_tokens,
     save_metadata,
     tokenize_jsonl,
+    tokenize_jsonl_to_npy,
 )
 
 
@@ -88,6 +89,12 @@ def main():
         "--force",
         action="store_true",
         help="Force retokenization even if output files exist"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4096,
+        help="Batch size for tokenizer.encode_batch (default: 4096)"
     )
 
     args = parser.parse_args()
@@ -175,43 +182,51 @@ def main():
         print("Tokenizing training data")
         print(f"{'='*60}\n")
 
-        train_tokens, train_offsets = tokenize_jsonl(
+        print("Streaming tokens directly to NPY (train)...")
+        train_info = tokenize_jsonl_to_npy(
             train_jsonl,
             tokenizer,
+            train_output,
+            train_offsets_output,
             text_field=args.text_field,
-            add_eos=not args.no_eos
+            add_eos=not args.no_eos,
+            batch_size=args.batch_size
         )
 
-        num_train_docs = len(train_offsets) - 1
+        num_train_docs = train_info['num_docs']
+        train_tokens_count = train_info['total_tokens']
         print(f"\nTraining documents: {num_train_docs:,}")
-        print(f"Training tokens: {len(train_tokens):,}")
+        print(f"Training tokens: {train_tokens_count:,}")
 
         # Tokenize validation data
         print(f"\n{'='*60}")
         print("Tokenizing validation data")
         print(f"{'='*60}\n")
 
-        validation_tokens, validation_offsets = tokenize_jsonl(
+        print("Streaming tokens directly to NPY (validation)...")
+        val_info = tokenize_jsonl_to_npy(
             validation_jsonl,
             tokenizer,
+            validation_output,
+            validation_offsets_output,
             text_field=args.text_field,
-            add_eos=not args.no_eos
+            add_eos=not args.no_eos,
+            batch_size=args.batch_size
         )
 
-        num_val_docs = len(validation_offsets) - 1
+        num_val_docs = val_info['num_docs']
+        val_tokens_count = val_info['total_tokens']
         print(f"\nValidation documents: {num_val_docs:,}")
-        print(f"Validation tokens: {len(validation_tokens):,}")
+        print(f"Validation tokens: {val_tokens_count:,}")
 
         # Save tokenized data
         print(f"\n{'='*60}")
         print("Saving pretokenized data")
         print(f"{'='*60}\n")
 
-        save_document_tokens(train_tokens, train_offsets, train_output, train_offsets_output)
+        # Already written by streaming path
         print(f"Saved training tokens to {train_output}")
         print(f"Saved training offsets to {train_offsets_output}")
-
-        save_document_tokens(validation_tokens, validation_offsets, validation_output, validation_offsets_output)
         print(f"Saved validation tokens to {validation_output}")
         print(f"Saved validation offsets to {validation_offsets_output}")
 
@@ -219,16 +234,16 @@ def main():
         metadata = {
             "tokenizer_name": args.tokenizer,
             "vocab_size": vocab_size,
-            "train_tokens": int(len(train_tokens)),
+            "train_tokens": int(train_tokens_count),
             "train_documents": num_train_docs,
-            "validation_tokens": int(len(validation_tokens)),
+            "validation_tokens": int(val_tokens_count),
             "validation_documents": num_val_docs,
-            "total_tokens": int(len(train_tokens) + len(validation_tokens)),
+            "total_tokens": int(train_tokens_count + val_tokens_count),
             "total_documents": num_train_docs + num_val_docs,
             "text_field": args.text_field,
             "add_eos": not args.no_eos,
-            "dtype": str(train_tokens.dtype),
-            "offset_dtype": str(train_offsets.dtype),
+            "dtype": train_info['token_dtype'],
+            "offset_dtype": train_info.get('offset_dtype', 'uint32'),
             "created_at": datetime.now().isoformat(),
             "dataset_name": config.name,
             "dataset_key": config.key,

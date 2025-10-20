@@ -3,11 +3,13 @@
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
+import struct
 
 import numpy as np
 from tokenizers import Tokenizer
 from tqdm import tqdm
+import os
 
 from .exceptions import LoaderError
 
@@ -46,7 +48,8 @@ def tokenize_jsonl(
     jsonl_path: Path,
     tokenizer,
     text_field: str = "text",
-    add_eos: bool = True
+    add_eos: bool = True,
+    batch_size: int = 4096
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Tokenize all text from a JSONL file using the fast tokenizers library.
@@ -69,7 +72,10 @@ def tokenize_jsonl(
     if not jsonl_path.exists():
         raise LoaderError(f"JSONL file not found: {jsonl_path}")
 
-    all_tokens = []
+    # Enable parallelism in HF tokenizers for speed if not explicitly disabled
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+
+    all_tokens: List[int] = []
     offsets = [0]  # Track document boundaries (start index of each document)
 
     # Try to get EOS token ID if needed
@@ -83,37 +89,52 @@ def tokenize_jsonl(
                 break
 
     try:
-        # First pass: count lines for progress bar
-        with open(jsonl_path, 'r', encoding='utf-8') as f:
-            num_lines = sum(1 for _ in f)
+        # Optional faster JSON lib
+        try:
+            import orjson as fastjson  # type: ignore
+            def _loads(x: str):
+                return fastjson.loads(x)
+        except Exception:
+            def _loads(x: str):
+                return json.loads(x)
 
-        # Second pass: tokenize
+        # Stream file and tokenize in batches for throughput
+        texts: List[str] = []
+
+        def _process_batch(batch_texts: List[str]):
+            nonlocal all_tokens, offsets
+            if not batch_texts:
+                return
+            # Use encode_batch for higher throughput
+            encodings = tokenizer.encode_batch(batch_texts)
+            for enc in encodings:
+                toks = enc.ids
+                if eos_token_id is not None:
+                    # Append EOS without reallocating too much
+                    all_tokens.extend(toks)
+                    all_tokens.append(eos_token_id)
+                else:
+                    all_tokens.extend(toks)
+                offsets.append(len(all_tokens))
+
         with open(jsonl_path, 'r', encoding='utf-8') as f:
-            for line in tqdm(f, total=num_lines, desc=f"Tokenizing {jsonl_path.name}"):
+            for line in f:
                 if not line.strip():
                     continue
-
-                record = json.loads(line)
-
+                record = _loads(line)
                 if text_field not in record:
                     raise LoaderError(
-                        f"Text field '{text_field}' not found in record. " +
+                        f"Text field '{text_field}' not found in record. "
                         f"Available fields: {list(record.keys())}"
                     )
+                texts.append(record[text_field])
+                if len(texts) >= batch_size:
+                    _process_batch(texts)
+                    texts = []
 
-                text = record[text_field]
-
-                # Tokenize using the fast tokenizers library
-                encoding = tokenizer.encode(text)
-                tokens = encoding.ids
-
-                # Add EOS token if requested and found
-                if eos_token_id is not None:
-                    tokens = list(tokens) + [eos_token_id]
-
-                all_tokens.extend(tokens)
-                # Track the end position of this document (= start of next document)
-                offsets.append(len(all_tokens))
+            # Flush tail
+            if texts:
+                _process_batch(texts)
 
         # Convert to numpy array with appropriate dtype
         vocab_size = tokenizer.get_vocab_size()
@@ -122,14 +143,14 @@ def tokenize_jsonl(
         else:
             dtype = np.uint32
 
-        tokens_array = np.array(all_tokens, dtype=dtype)
+        tokens_array = np.frombuffer(np.asarray(all_tokens, dtype=dtype))
 
         # Convert offsets to numpy array (use uint32 or uint64 based on total tokens)
         if len(all_tokens) < 2**32:
             offset_dtype = np.uint32
         else:
             offset_dtype = np.uint64
-        offsets_array = np.array(offsets, dtype=offset_dtype)
+        offsets_array = np.frombuffer(np.asarray(offsets, dtype=offset_dtype))
 
         return tokens_array, offsets_array
 
@@ -248,7 +269,159 @@ def load_tokens(token_path: Path, mmap_mode: str = None) -> np.ndarray:
             # NPZ files cannot be memory-mapped
             with np.load(token_path) as data:
                 tokens = data['tokens']
-            return tokens
+    return tokens
+
+
+def tokenize_jsonl_to_npy(
+    jsonl_path: Path,
+    tokenizer,
+    tokens_out: Path,
+    offsets_out: Path,
+    text_field: str = "text",
+    add_eos: bool = True,
+    batch_size: int = 4096,
+    tmp_dir: Optional[Path] = None
+) -> dict:
+    """
+    Stream-tokenize a JSONL file and write tokens/offsets directly to NPY files
+    without holding all tokens in memory.
+
+    Implementation writes to temporary raw binaries and then converts to NPY
+    once sizes are known.
+
+    Returns a dict with counts and dtypes.
+    """
+    if not jsonl_path.exists():
+        raise LoaderError(f"JSONL file not found: {jsonl_path}")
+
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+
+    # Determine token dtype from vocab size
+    vocab_size = tokenizer.get_vocab_size()
+    token_dtype = np.uint16 if vocab_size < 2**16 else np.uint32
+
+    # Detect EOS id
+    eos_token_id = None
+    if add_eos:
+        for eos_token in ["<|endoftext|>", "</s>", "<eos>", "[EOS]"]:
+            token_id = tokenizer.token_to_id(eos_token)
+            if token_id is not None:
+                eos_token_id = token_id
+                break
+
+    # Temp files
+    tmp_dir = tmp_dir or tokens_out.parent
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_tokens = tmp_dir / (tokens_out.stem + ".bin")
+    tmp_offsets = tmp_dir / (offsets_out.stem + ".bin")
+
+    # JSON loader (fast if available)
+    try:
+        import orjson as fastjson  # type: ignore
+        def _loads(x: str):
+            return fastjson.loads(x)
+    except Exception:
+        def _loads(x: str):
+            return json.loads(x)
+
+    total_tokens = 0
+    num_docs = 0
+
+    # Open temp files and start streaming
+    with open(jsonl_path, 'r', encoding='utf-8') as f_in, \
+         open(tmp_tokens, 'wb') as f_tok, \
+         open(tmp_offsets, 'wb') as f_off:
+
+        # Write initial 0 offset
+        np.array([0], dtype=np.uint64).tofile(f_off)
+
+        texts: List[str] = []
+
+        def _process_batch(batch_texts: List[str]):
+            nonlocal total_tokens, num_docs
+            if not batch_texts:
+                return
+            encodings = tokenizer.encode_batch(batch_texts)
+
+            # Prepare a flat token buffer for this batch
+            batch_buf: List[int] = []
+            lens: List[int] = []
+            for enc in encodings:
+                ids = enc.ids
+                if eos_token_id is not None:
+                    batch_buf.extend(ids)
+                    batch_buf.append(eos_token_id)
+                    ln = len(ids) + 1
+                else:
+                    batch_buf.extend(ids)
+                    ln = len(ids)
+                lens.append(ln)
+
+            # Write tokens (single write per batch)
+            if batch_buf:
+                np.asarray(batch_buf, dtype=token_dtype).tofile(f_tok)
+
+            # Write offsets (cumulative per doc)
+            if lens:
+                cumsum = 0
+                # Build small array of uint64 offsets for this batch
+                batch_offsets = np.empty(len(lens), dtype=np.uint64)
+                for i, ln in enumerate(lens):
+                    cumsum += ln
+                    batch_offsets[i] = total_tokens + cumsum
+                batch_offsets.tofile(f_off)
+
+                total_tokens += cumsum
+                num_docs += len(lens)
+
+        for line in f_in:
+            if not line.strip():
+                continue
+            rec = _loads(line)
+            if text_field not in rec:
+                raise LoaderError(
+                    f"Text field '{text_field}' not found in record. "
+                    f"Available fields: {list(rec.keys())}"
+                )
+            texts.append(rec[text_field])
+            if len(texts) >= batch_size:
+                _process_batch(texts)
+                texts = []
+
+        if texts:
+            _process_batch(texts)
+
+    # Convert tmp binaries to final NPY files
+    # Tokens
+    tokens_mmap = np.memmap(tmp_tokens, dtype=token_dtype, mode='r')
+    # Create final npy via memmap and copy
+    from numpy.lib.format import open_memmap
+    final_tokens = open_memmap(tokens_out, mode='w+', dtype=token_dtype, shape=(total_tokens,))
+    final_tokens[:] = tokens_mmap[:total_tokens]
+    del final_tokens
+    del tokens_mmap
+
+    # Offsets
+    offsets_raw = np.fromfile(tmp_offsets, dtype=np.uint64)
+    # Choose smaller dtype if possible
+    offset_dtype = np.uint32 if total_tokens < 2**32 else np.uint64
+    offsets_final = offsets_raw.astype(offset_dtype, copy=False)
+    np.save(offsets_out, offsets_final)
+
+    # Cleanup tmp files
+    try:
+        tmp_tokens.unlink(missing_ok=True)
+        tmp_offsets.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return {
+        'total_tokens': int(total_tokens),
+        'num_docs': int(num_docs),
+        'token_dtype': str(np.dtype(token_dtype)),
+        'offset_dtype': str(np.dtype(offset_dtype)),
+        'eos_token_id': int(eos_token_id) if eos_token_id is not None else None,
+    }
         else:
             # NPY files can be memory-mapped for efficient loading
             tokens = np.load(token_path, mmap_mode=mmap_mode)
