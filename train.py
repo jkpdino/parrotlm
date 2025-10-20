@@ -405,7 +405,8 @@ class TrainingApp(App):
             'validation': [],
             'inference': [],
             'checkpoint': [],
-            'total_step': []
+            'total_step': [],
+            'compute_only': []
         }
 
         # CUDA prefetcher (set during initialization when on CUDA)
@@ -648,6 +649,11 @@ class TrainingApp(App):
                 self.is_training = False
             self._save_checkpoint()
             self._cleanup_profiler()
+            try:
+                if self.metrics_tracker:
+                    self.metrics_tracker.close()
+            except Exception:
+                pass
             return
 
         if self.config.training.max_tokens and self.tokens_seen >= self.config.training.max_tokens:
@@ -655,6 +661,11 @@ class TrainingApp(App):
                 self.is_training = False
             self._save_checkpoint()
             self._cleanup_profiler()
+            try:
+                if self.metrics_tracker:
+                    self.metrics_tracker.close()
+            except Exception:
+                pass
             return
 
         # Get batch (overlap H2D transfers on CUDA with compute using prefetcher)
@@ -825,6 +836,8 @@ class TrainingApp(App):
 
         # Record timings
         total_step_time = time.time() - step_start
+        # Compute-only time excludes housekeeping done infrequently on some steps
+        compute_only_time = total_step_time - (validation_time + inference_time + checkpoint_time + metrics_time)
         self._record_timing('data_loading', data_time)
         self._record_timing('model_forward', model_forward_time)
         self._record_timing('loss_computation', loss_compute_time)
@@ -838,6 +851,7 @@ class TrainingApp(App):
         self._record_timing('inference', inference_time)
         self._record_timing('checkpoint', checkpoint_time)
         self._record_timing('total_step', total_step_time)
+        self._record_timing('compute_only', compute_only_time)
 
     def _record_timing(self, category: str, duration: float) -> None:
         """Record timing for a category, keeping only last N samples."""
@@ -1103,6 +1117,7 @@ class TrainingApp(App):
         avg_metrics = self._get_avg_timing('metrics_log')
         avg_val = self._get_avg_timing('validation')
         avg_inf = self._get_avg_timing('inference')
+        avg_compute = self._get_avg_timing('compute_only')
 
         # Calculate accounted time and overhead
         accounted = avg_data + avg_model_fwd + avg_loss + avg_backward + avg_grad_clip + avg_optim + avg_lr + avg_metrics
@@ -1112,6 +1127,8 @@ class TrainingApp(App):
         timing_parts = []
         if avg_total > 0:
             timing_parts.append(f"Total:{avg_total:.1f}ms")
+        if avg_compute > 0:
+            timing_parts.append(f"Compute:{avg_compute:.1f}ms")
         if avg_data > 0:
             timing_parts.append(f"Data:{avg_data:.1f}ms")
         if avg_model_fwd > 0:
@@ -1218,6 +1235,11 @@ class TrainingApp(App):
         # Save final checkpoint and cleanup
         self._save_checkpoint()
         self._cleanup_profiler()
+        try:
+            if self.metrics_tracker:
+                self.metrics_tracker.close()
+        except Exception:
+            pass
         self.exit()
 
 

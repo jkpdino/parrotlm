@@ -1,6 +1,12 @@
-"""Metrics tracking and visualization for training."""
+"""Metrics tracking and visualization for training.
+
+Adds an asynchronous CSV writer to avoid blocking the training loop with
+filesystem I/O. Metrics are still kept in memory for live graphs.
+"""
 
 import csv
+import threading
+import queue
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -75,6 +81,16 @@ class MetricsTracker:
         else:
             self._create_csv()
 
+        # Open file handle once and start background writer
+        self._fh = open(self.csv_path, 'a', newline='')
+        self._csv_writer = csv.writer(self._fh)
+
+        # Async queue and writer thread to avoid blocking training
+        self._queue: queue.Queue[list] = queue.Queue(maxsize=10000)
+        self._stop_event = threading.Event()
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._writer_thread.start()
+
     def _create_csv(self) -> None:
         """Create a new CSV file with headers."""
         with open(self.csv_path, 'w', newline='') as f:
@@ -87,6 +103,28 @@ class MetricsTracker:
                 'learning_rate',
                 'timestamp'
             ])
+
+    def _writer_loop(self) -> None:
+        """Background thread: write queued rows and flush periodically."""
+        pending = 0
+        while not self._stop_event.is_set() or not self._queue.empty():
+            try:
+                row = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                row = None
+
+            if row is not None:
+                self._csv_writer.writerow(row)
+                pending += 1
+                self._queue.task_done()
+
+            # Flush every 50 rows or on idle
+            if pending >= 50 or (row is None and pending > 0):
+                try:
+                    self._fh.flush()
+                except Exception:
+                    pass
+                pending = 0
 
     def _load_from_csv(self) -> None:
         """Load existing metrics from CSV file."""
@@ -164,10 +202,9 @@ class MetricsTracker:
         self.total_batches = max(self.total_batches, batch)
         self.total_tokens = max(self.total_tokens, tokens_seen)
 
-        # Append to CSV
-        with open(self.csv_path, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
+        # Queue for asynchronous CSV writing
+        try:
+            self._queue.put_nowait([
                 batch,
                 tokens_seen,
                 train_loss if train_loss is not None else '',
@@ -175,6 +212,41 @@ class MetricsTracker:
                 learning_rate,
                 timestamp
             ])
+        except queue.Full:
+            # As a fallback, drop oldest by getting one and then putting new
+            try:
+                _ = self._queue.get_nowait()
+                self._queue.task_done()
+                self._queue.put_nowait([
+                    batch,
+                    tokens_seen,
+                    train_loss if train_loss is not None else '',
+                    val_loss if val_loss is not None else '',
+                    learning_rate,
+                    timestamp
+                ])
+            except Exception:
+                # If still failing, skip writing this row (keeps training unblocked)
+                pass
+
+    def close(self) -> None:
+        """Stop background writer and close file handle (flush pending)."""
+        if hasattr(self, "_stop_event"):
+            self._stop_event.set()
+        if hasattr(self, "_writer_thread") and self._writer_thread.is_alive():
+            self._writer_thread.join(timeout=2.0)
+        # Flush whatever is left
+        try:
+            if hasattr(self, "_fh"):
+                self._fh.flush()
+        except Exception:
+            pass
+        # Close file
+        try:
+            if hasattr(self, "_fh"):
+                self._fh.close()
+        except Exception:
+            pass
 
     def get_windowed_train_losses(self) -> List[Tuple[int, float]]:
         """
