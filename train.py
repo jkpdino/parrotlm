@@ -601,6 +601,10 @@ class TrainingApp(App):
         # Forward pass with mixed precision
         forward_start = time.time()
         self.model.train()
+
+        # DIAGNOSTIC: Check if this is first forward pass (model compiling)
+        # First ~10 batches may be slower due to torch.compile warmup
+
         with record_function("forward"):
             # Use autocast for CUDA mixed precision training
             with torch.amp.autocast('cuda', dtype=torch.float16, enabled=self.use_amp):
@@ -702,9 +706,9 @@ class TrainingApp(App):
         self._set_lr(self.current_lr)
         lr_time = time.time() - lr_start
 
-        # Log metrics (only every 10 batches to reduce overhead)
+        # Log metrics (only every 100 batches to reduce overhead - was every 10)
         metrics_time = 0.0
-        if self.current_batch % 10 == 0:
+        if self.current_batch % 100 == 0:
             metrics_start = time.time()
             self.metrics_tracker.log(
                 batch=self.current_batch,
