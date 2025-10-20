@@ -21,12 +21,8 @@ model:
 # Data configuration
 data:
   dataset_path: "datasets/fineweb_edu_4b/pretokenized/tokenizer" # Update if you use a different output path
-<<<<<<< HEAD
-  tokenizer_path: "mistralai/Mistral-7B-v0.1" # Use LLaMA 2 7B tokenizer from HF Hub
-=======
   tokenizer_path: "mistralai/Mistral-7B-v0.1" # Public LLaMA-family tokenizer (32000 vocab)
->>>>>>> origin/main
-  batch_size: 64 # Adjust based on GPU memory; use accumulate_steps if needed
+  batch_size: 32 # Adjust based on GPU memory; use accumulate_steps if needed
   shuffle: false
   num_workers: 0
 
