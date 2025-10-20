@@ -330,6 +330,8 @@ class TrainingApp(App):
             'forward': [],
             'loss_computation': [],
             'backward': [],
+            'grad_check': [],
+            'grad_clip': [],
             'optimizer_step': [],
             'validation': [],
             'inference': [],
@@ -633,27 +635,34 @@ class TrainingApp(App):
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
+        backward_time = time.time() - backward_start
 
-        # Check for gradient NaN/Inf after backward
-        has_nan_grad = False
-        for param in self.model.parameters():
-            if param.grad is not None and not torch.isfinite(param.grad).all():
-                has_nan_grad = True
-                break
+        # Check for gradient NaN/Inf after backward (only every 100 batches to reduce overhead)
+        grad_check_time = 0.0
+        if self.current_batch % 100 == 0:
+            check_start = time.time()
+            has_nan_grad = False
+            for param in self.model.parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    has_nan_grad = True
+                    break
+            grad_check_time = time.time() - check_start
 
-        if has_nan_grad:
-            with self.state_lock:
-                self.is_training = False
-            # Safely update UI from training thread
-            self.call_from_thread(
-                self.query_one("#metrics-bar", Static).update,
-                "[bold red]TRAINING STOPPED: Gradients became NaN/Inf. Try lowering learning rate.[/bold red]"
-            )
-            return
+            if has_nan_grad:
+                with self.state_lock:
+                    self.is_training = False
+                # Safely update UI from training thread
+                self.call_from_thread(
+                    self.query_one("#metrics-bar", Static).update,
+                    "[bold red]TRAINING STOPPED: Gradients became NaN/Inf. Try lowering learning rate.[/bold red]"
+                )
+                return
 
         # Gradient clipping
-        with record_function("gradient_clipping"):
-            if self.config.training.grad_clip:
+        grad_clip_time = 0.0
+        if self.config.training.grad_clip:
+            clip_start = time.time()
+            with record_function("gradient_clipping"):
                 if self.use_amp:
                     # Unscale gradients before clipping
                     self.scaler.unscale_(self.optimizer)
@@ -661,7 +670,7 @@ class TrainingApp(App):
                     self.model.parameters(),
                     self.config.training.grad_clip
                 )
-        backward_time = time.time() - backward_start
+            grad_clip_time = time.time() - clip_start
 
         # Optimizer step with gradient scaling
         optim_start = time.time()
@@ -720,6 +729,8 @@ class TrainingApp(App):
         self._record_timing('data_loading', data_time)
         self._record_timing('forward', forward_time)
         self._record_timing('backward', backward_time)
+        self._record_timing('grad_check', grad_check_time)
+        self._record_timing('grad_clip', grad_clip_time)
         self._record_timing('optimizer_step', optim_time)
         self._record_timing('validation', validation_time)
         self._record_timing('inference', inference_time)
@@ -982,6 +993,8 @@ class TrainingApp(App):
         avg_data = self._get_avg_timing('data_loading')
         avg_forward = self._get_avg_timing('forward')
         avg_backward = self._get_avg_timing('backward')
+        avg_grad_check = self._get_avg_timing('grad_check')
+        avg_grad_clip = self._get_avg_timing('grad_clip')
         avg_optim = self._get_avg_timing('optimizer_step')
         avg_val = self._get_avg_timing('validation')
         avg_inf = self._get_avg_timing('inference')
@@ -996,6 +1009,10 @@ class TrainingApp(App):
             timing_parts.append(f"Fwd:{avg_forward:.1f}ms")
         if avg_backward > 0:
             timing_parts.append(f"Bwd:{avg_backward:.1f}ms")
+        if avg_grad_check > 1:
+            timing_parts.append(f"GradChk:{avg_grad_check:.1f}ms")
+        if avg_grad_clip > 0:
+            timing_parts.append(f"GradClip:{avg_grad_clip:.1f}ms")
         if avg_optim > 0:
             timing_parts.append(f"Opt:{avg_optim:.1f}ms")
         if avg_val > 1:  # Only show if > 1ms
