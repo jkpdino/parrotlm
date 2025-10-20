@@ -323,6 +323,11 @@ class TrainingApp(App):
         self.current_lr = config.training.learning_rate
         self.start_time = time.time()
 
+        # Data prefetching (load next batch while GPU processes current)
+        self.next_batch = None
+        self.data_queue = None  # Will hold prefetched batch
+        self.prefetch_thread = None
+
         # Performance timing diagnostics
         self.timing_samples = 100  # Average over last N samples
         self.timings = {
@@ -579,7 +584,8 @@ class TrainingApp(App):
             self._cleanup_profiler()
             return
 
-        # Get batch
+        # Get batch - just load synchronously for now
+        # TODO: Implement proper async prefetching with background thread
         data_start = time.time()
         with record_function("data_loading"):
             try:
@@ -639,16 +645,16 @@ class TrainingApp(App):
                 loss.backward()
         backward_time = time.time() - backward_start
 
-        # Check for gradient NaN/Inf after backward (disabled for speed - loss check above catches most issues)
+        # Check for gradient NaN/Inf after backward (disabled by default - loss check above catches most issues)
         grad_check_time = 0.0
-        # Uncomment to enable periodic gradient NaN checking:
+        # GPU-only NaN check (much faster - no CPU sync):
+        # Uncomment to enable (checks every 1000 batches, takes ~5-10ms instead of 143ms):
         # if self.current_batch % 1000 == 0:
         #     check_start = time.time()
-        #     has_nan_grad = False
-        #     for param in self.model.parameters():
-        #         if param.grad is not None and not torch.isfinite(param.grad).all():
-        #             has_nan_grad = True
-        #             break
+        #     # Flatten all gradients into a single tensor (stays on GPU)
+        #     grads = torch.cat([p.grad.flatten() for p in self.model.parameters() if p.grad is not None])
+        #     # Single GPU check for all gradients (no CPU sync until .item())
+        #     has_nan_grad = not torch.isfinite(grads).all().item()
         #     grad_check_time = time.time() - check_start
         #
         #     if has_nan_grad:

@@ -361,24 +361,30 @@ class DocumentBatchLoader:
             padding_mask = batch_tokens == self.pad_token_id
             batch_labels[padding_mask] = self.label_ignore_index
 
-        # Convert to PyTorch tensors
+        # Convert to PyTorch tensors with pinned memory for faster CPU->GPU transfer
         batch_tokens = torch.from_numpy(batch_tokens).long()
+        if self.device is not None and str(self.device).startswith('cuda'):
+            batch_tokens = batch_tokens.pin_memory()
 
         # Convert masks to additive format (0.0 for attend, -inf for don't attend)
         if self.return_masks:
             batch_masks = torch.from_numpy(batch_masks.astype(np.float32))
             batch_masks = torch.where(batch_masks == 1.0, 0.0, float('-inf'))
+            if self.device is not None and str(self.device).startswith('cuda'):
+                batch_masks = batch_masks.pin_memory()
 
         if batch_labels is not None:
             batch_labels = torch.from_numpy(batch_labels).long()
+            if self.device is not None and str(self.device).startswith('cuda'):
+                batch_labels = batch_labels.pin_memory()
 
-        # Move to device if specified
+        # Move to device if specified (non_blocking for pinned memory)
         if self.device is not None:
-            batch_tokens = batch_tokens.to(self.device)
+            batch_tokens = batch_tokens.to(self.device, non_blocking=True)
             if self.return_masks:
-                batch_masks = batch_masks.to(self.device)
+                batch_masks = batch_masks.to(self.device, non_blocking=True)
             if batch_labels is not None:
-                batch_labels = batch_labels.to(self.device)
+                batch_labels = batch_labels.to(self.device, non_blocking=True)
 
         self.current_batch += 1
 
