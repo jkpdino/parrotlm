@@ -186,18 +186,28 @@ class CheckpointManager:
         if 'rng_state' in checkpoint:
             rng_state = checkpoint['rng_state']
             if rng_state.get('python') is not None:
-                # Ensure RNG state is ByteTensor
+                # Ensure RNG state is ByteTensor on CPU
                 python_state = rng_state['python']
                 if not isinstance(python_state, torch.ByteTensor):
                     python_state = python_state.byte()
+                # Move to CPU if on CUDA device
+                if python_state.is_cuda:
+                    python_state = python_state.cpu()
                 torch.set_rng_state(python_state)
             if rng_state.get('numpy') is not None:
-                torch.random.set_rng_state(rng_state['numpy'])
+                numpy_state = rng_state['numpy']
+                # Move to CPU if on CUDA device
+                if numpy_state.is_cuda:
+                    numpy_state = numpy_state.cpu()
+                torch.random.set_rng_state(numpy_state)
             if rng_state.get('cuda') is not None and torch.cuda.is_available():
-                # Ensure CUDA RNG states are ByteTensors
+                # Ensure CUDA RNG states are ByteTensors on CPU
                 cuda_states = rng_state['cuda']
                 if isinstance(cuda_states, list):
-                    cuda_states = [s.byte() if not isinstance(s, torch.ByteTensor) else s for s in cuda_states]
+                    cuda_states = [
+                        (s.cpu() if s.is_cuda else s).byte() if not isinstance(s, torch.ByteTensor) else (s.cpu() if s.is_cuda else s)
+                        for s in cuda_states
+                    ]
                 torch.cuda.set_rng_state_all(cuda_states)
 
         return checkpoint
