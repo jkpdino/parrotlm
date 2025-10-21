@@ -30,7 +30,7 @@ data:
 training:
   learning_rate: 0.003
   max_batches: null
-  max_tokens: 1000000000
+  max_tokens: 4000000000
   optimizer: "adamw"
   warmup_batches: 100
   weight_decay: 0.1
